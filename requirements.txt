@@ -1,0 +1,7 @@
+streamlit
+fitparse
+gpxpy
+plotly
+pandas
+watchdog
+fpdf2
