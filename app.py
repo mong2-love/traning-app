@@ -87,7 +87,17 @@ def fmt_pace(sec_per_km):
 
 
 # ── FIT 파싱 ────────────────────────────────────────────────────────────────────
-def parse_fit(path, max_hr, ftp):
+# def_num → 내부 컬럼명  (fitparse가 scale/offset 자동 적용)
+# 253=timestamp, 3=heart_rate, 4=cadence, 5=distance(m),
+# 6=speed(m/s), 7=power(W), 2=altitude(m)
+_FIT_DEF_MAP  = {253: "timestamp", 3: "hr", 4: "cad",
+                 5: "distance",    6: "speed", 7: "watts", 2: "altitude"}
+_FIT_NAME_MAP = {"timestamp": "timestamp", "heart_rate": "hr", "cadence": "cad",
+                 "distance": "distance",   "speed": "speed",
+                 "power": "watts",         "altitude": "altitude"}
+
+
+def parse_fit(path: str, max_hr: int, ftp: int):
     try:
         from fitparse import FitFile
     except ImportError:
@@ -100,101 +110,142 @@ def parse_fit(path, max_hr, ftp):
         st.error(f"FIT 파일 읽기 실패: {e}")
         return None
 
-    records = []
+    records      = []
     session_data = {}
 
     for msg in ff.get_messages():
-        name = msg.name
-        if name == "record":
-            row = {f.name: f.value for f in msg.fields}
+        if msg.name == "record":
+            row = {}
+            for f in msg.fields:
+                col = _FIT_DEF_MAP.get(f.def_num) or _FIT_NAME_MAP.get(f.name)
+                if col and col not in row:
+                    row[col] = f.value
             records.append(row)
-        elif name == "session":
+        elif msg.name == "session":
             session_data = {f.name: f.value for f in msg.fields}
 
-    df = pd.DataFrame(records)
-    if df.empty:
+    if not records:
         return None
 
-    sport = session_data.get("sport", "unknown")
-    if isinstance(sport, str):
-        sport = sport.lower()
+    df = pd.DataFrame(records)
 
-    indoor_flag = int(session_data.get("sub_sport", "").lower() in ["indoor_cycling", "treadmill", "virtual_activity"]
-                      if isinstance(session_data.get("sub_sport", ""), str) else False)
+    # 단위 변환: speed m/s → kph,  distance m → km
+    if "speed" in df.columns:
+        df["kph"] = pd.to_numeric(df["speed"], errors="coerce") * 3.6
+    if "distance" in df.columns:
+        df["km"] = pd.to_numeric(df["distance"], errors="coerce") / 1000.0
 
-    ts_col = next((c for c in ["timestamp", "time"] if c in df.columns), None)
-    start_time = None
-    duration_sec = session_data.get("total_elapsed_time")
-    if ts_col and len(df) > 1:
-        try:
-            times = pd.to_datetime(df[ts_col])
-            start_time = times.iloc[0]
-            if duration_sec is None:
-                duration_sec = (times.iloc[-1] - times.iloc[0]).total_seconds()
-        except Exception:
-            pass
+    # 타임스탬프 → secs(경과초) + 날짜
+    date_str     = str(date.today())
+    moving_time  = None
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        valid_ts = ts.dropna()
+        if len(valid_ts) > 0:
+            date_str    = valid_ts.iloc[0].strftime("%Y-%m-%d")
+            secs        = (ts - valid_ts.iloc[0]).dt.total_seconds()
+            df["secs"]  = secs
+            secs_diff   = secs.diff().fillna(1.0)
+            moving_time = float(secs_diff[secs_diff < 30].sum())
 
-    date_str = (start_time.strftime("%Y-%m-%d") if start_time
-                else session_data.get("start_time", datetime.today()).strftime("%Y-%m-%d")
-                if hasattr(session_data.get("start_time", ""), "strftime") else str(date.today()))
+    # 파워 스파이크 보정 — 전후 5초 중앙값의 3배 & 400W 초과 → 중앙값으로 대체
+    if "watts" in df.columns:
+        df["watts"]  = pd.to_numeric(df["watts"], errors="coerce")
+        roll_med     = df["watts"].rolling(window=11, center=True, min_periods=1).median()
+        spike_mask   = (df["watts"] > roll_med * 3) & (df["watts"] > 400)
+        df.loc[spike_mask, "watts"] = roll_med[spike_mask]
 
-    distance_km = session_data.get("total_distance", 0)
-    if distance_km and distance_km > 1000:
-        distance_km /= 1000.0
+    # sport / indoor
+    sport = str(session_data.get("sport", "unknown")).lower()
+    indoor_flag = int(
+        str(session_data.get("sub_sport", "")).lower()
+        in ["indoor_cycling", "treadmill", "virtual_activity"]
+    )
 
-    hr_col = next((c for c in ["heart_rate"] if c in df.columns), None)
-    pwr_col = next((c for c in ["power"] if c in df.columns), None)
-    cad_col = next((c for c in ["cadence"] if c in df.columns), None)
+    # 거리
+    distance_km = None
+    if "km" in df.columns:
+        km_valid = df["km"].dropna()
+        distance_km = float(km_valid.max()) if len(km_valid) > 0 else None
+    if not distance_km:
+        raw_dist = session_data.get("total_distance")
+        if raw_dist:
+            distance_km = raw_dist / 1000.0 if raw_dist > 1000 else raw_dist
 
-    avg_hr = float(df[hr_col].mean()) if hr_col else None
-    max_hr_val = float(df[hr_col].max()) if hr_col else None
-    avg_power = float(df[pwr_col].mean()) if pwr_col else None
-    max_power = float(df[pwr_col].max()) if pwr_col else None
-    avg_cad = float(df[cad_col].mean()) if cad_col else None
+    # duration
+    duration_sec = moving_time or session_data.get("total_elapsed_time")
 
-    w_per_bpm = (avg_power / avg_hr) if avg_power and avg_hr else None
+    # 심박
+    hr_valid   = df["hr"].dropna()  if "hr"    in df.columns else pd.Series(dtype=float)
+    avg_hr     = float(hr_valid.mean()) if len(hr_valid) > 0 else None
+    max_hr_val = float(hr_valid.max())  if len(hr_valid) > 0 else None
 
-    # 드리프트: 후반부 평균HR / 전반부 평균HR
+    # 파워
+    w_valid   = df["watts"].dropna() if "watts" in df.columns else pd.Series(dtype=float)
+    avg_power = float(w_valid.mean()) if len(w_valid) > 0 else None
+    max_power = float(w_valid.max())  if len(w_valid) > 0 else None
+
+    # 케이던스 (0 제외)
+    avg_cad = None
+    if "cad" in df.columns:
+        cad_valid = df[df["cad"] > 0]["cad"].dropna()
+        avg_cad   = float(cad_valid.mean()) if len(cad_valid) > 0 else None
+
+    # W/bpm 효율 — 파워 ≥10W, 심박 ≥80bpm 구간만
+    w_per_bpm = None
+    if "watts" in df.columns and "hr" in df.columns:
+        eff_mask = (df["watts"] >= 10) & (df["hr"] >= 80)
+        if eff_mask.sum() > 0:
+            ep = df.loc[eff_mask, "watts"].mean()
+            eh = df.loc[eff_mask, "hr"].mean()
+            w_per_bpm = round(ep / eh, 3) if eh > 0 else None
+
+    # 심박 드리프트
     drift = None
-    if hr_col and len(df) > 10:
+    if len(hr_valid) > 10:
         mid = len(df) // 2
-        h1 = df[hr_col].iloc[:mid].mean()
-        h2 = df[hr_col].iloc[mid:].mean()
+        h1  = df["hr"].iloc[:mid].mean()
+        h2  = df["hr"].iloc[mid:].mean()
         drift = round((h2 - h1) / h1 * 100, 1) if h1 else None
 
-    # 존 분포
-    zones = hr_zones(max_hr)
+    # 심박 존 분포
+    zones  = hr_zones(max_hr)
     z_pcts = [0.0] * 5
-    if hr_col:
-        hr_series = df[hr_col].dropna()
-        total = len(hr_series)
-        if total > 0:
-            for i, (lo, hi) in enumerate(zones):
-                z_pcts[i] = round(((hr_series >= lo) & (hr_series <= hi)).sum() / total * 100, 1)
+    total  = len(hr_valid)
+    if total > 0:
+        for i, (lo, hi) in enumerate(zones):
+            z_pcts[i] = round(((hr_valid >= lo) & (hr_valid <= hi)).sum() / total * 100, 1)
 
+    # 평균 페이스
     avg_pace = None
     if distance_km and duration_sec and distance_km > 0:
-        avg_pace = duration_sec / distance_km
+        avg_pace = round(duration_sec / distance_km, 1)
 
     calories = session_data.get("total_calories")
 
+    # 원시 데이터 저장 (차트용)
+    fname     = os.path.basename(path)
+    save_cols = [c for c in ["secs", "hr", "watts", "cad", "kph"] if c in df.columns]
+    if save_cols:
+        save_raw(fname, df[save_cols])
+
     return dict(
         date=date_str,
-        filename=os.path.basename(path),
+        filename=fname,
         sport=sport,
         indoor=indoor_flag,
         distance_km=round(distance_km, 2) if distance_km else None,
-        duration_sec=int(duration_sec) if duration_sec else None,
-        avg_hr=round(avg_hr, 1) if avg_hr else None,
-        max_hr=round(max_hr_val, 1) if max_hr_val else None,
-        avg_power=round(avg_power, 1) if avg_power else None,
-        max_power=round(max_power, 1) if max_power else None,
-        avg_cadence=round(avg_cad, 1) if avg_cad else None,
-        w_per_bpm=round(w_per_bpm, 3) if w_per_bpm else None,
+        duration_sec=int(duration_sec)    if duration_sec else None,
+        avg_hr=round(avg_hr, 1)           if avg_hr       else None,
+        max_hr=round(max_hr_val, 1)       if max_hr_val   else None,
+        avg_power=round(avg_power, 1)     if avg_power    else None,
+        max_power=round(max_power, 1)     if max_power    else None,
+        avg_cadence=round(avg_cad, 1)     if avg_cad      else None,
+        w_per_bpm=w_per_bpm,
         drift=drift,
         z1_pct=z_pcts[0], z2_pct=z_pcts[1], z3_pct=z_pcts[2],
         z4_pct=z_pcts[3], z5_pct=z_pcts[4],
-        avg_pace=round(avg_pace, 1) if avg_pace else None,
+        avg_pace=avg_pace,
         calories=float(calories) if calories else None,
     )
 
