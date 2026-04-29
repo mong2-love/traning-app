@@ -415,7 +415,7 @@ def load_raw(filename: str) -> pd.DataFrame:
             "SELECT raw_json FROM training_raw WHERE filename = ?", (filename,)
         ).fetchone()
     if row and row[0]:
-        return pd.read_json(row[0], orient="records")
+        return pd.DataFrame(json.loads(row[0]))
     return pd.DataFrame()
 
 
