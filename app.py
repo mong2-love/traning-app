@@ -502,7 +502,57 @@ def sidebar():
     st.sidebar.title("⚙️ 설정")
     max_hr = st.sidebar.number_input("최대 심박수 (bpm)", min_value=100, max_value=220, value=185, step=1)
     ftp = st.sidebar.number_input("FTP (watts)", min_value=50, max_value=500, value=170, step=5)
-    watch_dir = st.sidebar.text_input("감시 폴더 경로", value=os.path.expanduser("~/Downloads"))
+
+    # ── 폴더 선택기 ────────────────────────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("감시 폴더")
+
+    if "watch_dir" not in st.session_state:
+        st.session_state["watch_dir"] = os.path.expanduser("~/Downloads")
+
+    # 바로가기 버튼
+    quick = {"🖥️ 바탕화면": "~/Desktop", "📥 다운로드": "~/Downloads", "📄 문서": "~/Documents"}
+    q_cols = st.sidebar.columns(3)
+    for i, (label, path) in enumerate(quick.items()):
+        exp = os.path.expanduser(path)
+        if os.path.isdir(exp):
+            if q_cols[i].button(label, use_container_width=True):
+                st.session_state["watch_dir"] = exp
+                st.rerun()
+
+    # 텍스트 직접 입력
+    typed = st.sidebar.text_input("경로 직접 입력", value=st.session_state["watch_dir"])
+    if typed != st.session_state["watch_dir"]:
+        st.session_state["watch_dir"] = typed
+
+    watch_dir = st.session_state["watch_dir"]
+
+    # 하위 폴더 탐색
+    if os.path.isdir(watch_dir):
+        try:
+            subdirs = sorted([
+                d for d in os.listdir(watch_dir)
+                if os.path.isdir(os.path.join(watch_dir, d)) and not d.startswith(".")
+            ])
+            if subdirs:
+                sel_sub = st.sidebar.selectbox("📁 하위 폴더", ["(현재 폴더)"] + subdirs)
+                if sel_sub != "(현재 폴더)":
+                    new_path = os.path.join(watch_dir, sel_sub)
+                    if st.sidebar.button("이 폴더 선택", use_container_width=True):
+                        st.session_state["watch_dir"] = new_path
+                        watch_dir = new_path
+                        st.rerun()
+        except PermissionError:
+            pass
+
+        # 훈련 파일 개수 표시
+        try:
+            found = [f for f in os.listdir(watch_dir) if f.lower().endswith((".fit", ".gpx", ".csv"))]
+            st.sidebar.caption(f"훈련 파일 {len(found)}개 감지됨")
+        except PermissionError:
+            pass
+    else:
+        st.sidebar.warning("폴더를 찾을 수 없습니다.")
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("파일 업로드")
