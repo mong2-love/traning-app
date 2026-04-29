@@ -714,6 +714,7 @@ def tab_calendar(df: pd.DataFrame):
     year = col_y.selectbox("연도", list(range(today.year - 3, today.year + 1))[::-1], index=0)
     month = col_m.selectbox("월", list(range(1, 13)), index=today.month - 1)
 
+    df = df.copy()
     df["date"] = pd.to_datetime(df["date"]).dt.date
     month_df = df[(df["date"].apply(lambda d: d.year) == year) &
                   (df["date"].apply(lambda d: d.month) == month)]
@@ -859,13 +860,14 @@ def tab_report(df: pd.DataFrame):
         return
 
     today = date.today()
+    date_str_series = df["date"].astype(str)
     months_available = sorted(
-        df["date"].str[:7].unique().tolist(), reverse=True
+        date_str_series.str[:7].unique().tolist(), reverse=True
     )
     sel_month = st.selectbox("리포트 기간 (월)", months_available)
 
     if st.button("PDF 리포트 생성"):
-        m_df = df[df["date"].str.startswith(sel_month)]
+        m_df = df[df["date"].astype(str).str.startswith(sel_month)]
 
         pdf = FPDF()
         pdf.add_page()
