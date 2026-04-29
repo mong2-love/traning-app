@@ -983,7 +983,7 @@ def tab_records(df: pd.DataFrame):
     filtered = df if sport_filter == "전체" else df[df["sport"] == sport_filter]
 
     display_cols = {
-        "date": "날짜", "sport": "종목", "distance_km": "거리(km)",
+        "id": "ID", "date": "날짜", "sport": "종목", "distance_km": "거리(km)",
         "duration_sec": "시간", "avg_hr": "평균HR", "max_hr": "최대HR",
         "avg_power": "평균W", "avg_pace": "평균페이스", "calories": "칼로리",
         "w_per_bpm": "W/bpm", "drift": "드리프트%",
@@ -991,19 +991,36 @@ def tab_records(df: pd.DataFrame):
 
     show = filtered[[c for c in display_cols.keys() if c in filtered.columns]].copy()
     show["duration_sec"] = show["duration_sec"].apply(fmt_duration)
-    show["avg_pace"] = show["avg_pace"].apply(fmt_pace)
+    show["avg_pace"]     = show["avg_pace"].apply(fmt_pace)
     show.columns = [display_cols.get(c, c) for c in show.columns]
 
     st.dataframe(show, use_container_width=True, hide_index=True)
 
-    # 삭제
+    # ── 일괄 삭제 ──────────────────────────────────────────────────────────────
     st.markdown("---")
-    with st.expander("기록 삭제"):
-        del_id = st.number_input("삭제할 ID", min_value=1, step=1)
-        if st.button("삭제"):
+    st.subheader("기록 삭제")
+
+    id_to_label = {
+        row["id"]: f"{row['date']}  |  {row['sport']}  |  {row.get('distance_km') or '-'} km  |  {os.path.basename(str(row.get('filename','')))}'"
+        for _, row in filtered.iterrows()
+    }
+
+    selected_ids = st.multiselect(
+        "삭제할 기록 선택 (복수 선택 가능)",
+        options=list(id_to_label.keys()),
+        format_func=lambda x: id_to_label[x],
+    )
+
+    if selected_ids:
+        st.warning(f"{len(selected_ids)}개 기록이 선택됨")
+        if st.button("🗑️ 선택 기록 삭제", type="primary"):
             with get_conn() as conn:
-                conn.execute("DELETE FROM training_log WHERE id = ?", (int(del_id),))
-            st.success("삭제 완료. 페이지를 새로고침하세요.")
+                conn.execute(
+                    f"DELETE FROM training_log WHERE id IN ({','.join('?' * len(selected_ids))})",
+                    selected_ids,
+                )
+            st.success(f"{len(selected_ids)}개 기록 삭제 완료")
+            st.rerun()
 
 
 # ── 탭 4: 트렌드 ───────────────────────────────────────────────────────────────
@@ -1177,7 +1194,8 @@ def tab_settings(max_hr: int, ftp: int):
         if confirm:
             with get_conn() as conn:
                 conn.execute("DELETE FROM training_log")
-            st.success("삭제 완료. 페이지를 새로고침하세요.")
+            st.success("삭제 완료")
+            st.rerun()
 
 
 # ── 메인 ───────────────────────────────────────────────────────────────────────
