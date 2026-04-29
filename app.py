@@ -600,6 +600,25 @@ def sidebar():
     if "watch_dir" not in st.session_state:
         st.session_state["watch_dir"] = os.path.expanduser("~/Downloads")
 
+    # Windows 탐색기로 폴더 선택
+    if st.sidebar.button("📂 폴더 선택 (탐색기)", use_container_width=True):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.wm_attributes("-topmost", True)
+            folder = filedialog.askdirectory(
+                title="감시 폴더 선택",
+                initialdir=st.session_state["watch_dir"],
+            )
+            root.destroy()
+            if folder:
+                st.session_state["watch_dir"] = folder
+                st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"탐색기 오류: {e}")
+
     # 바로가기 버튼
     quick = {"🖥️ 바탕화면": "~/Desktop", "📥 다운로드": "~/Downloads", "📄 문서": "~/Documents"}
     q_cols = st.sidebar.columns(3)
