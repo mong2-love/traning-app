@@ -1,6 +1,7 @@
 import streamlit as st
 import sqlite3
 import os
+import tempfile
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -512,7 +513,7 @@ def sidebar():
     )
     if uploaded:
         for uf in uploaded:
-            tmp = f"/tmp/{uf.name}"
+            tmp = os.path.join(tempfile.gettempdir(), uf.name)
             with open(tmp, "wb") as f:
                 f.write(uf.read())
             data = parse_file(tmp, max_hr, ftp)
