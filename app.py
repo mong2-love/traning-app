@@ -861,46 +861,273 @@ def tab_calendar(df: pd.DataFrame):
         return
 
     today = date.today()
-    col_y, col_m = st.columns(2)
-    year = col_y.selectbox("연도", list(range(today.year - 3, today.year + 1))[::-1], index=0)
-    month = col_m.selectbox("월", list(range(1, 13)), index=today.month - 1)
 
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    month_df = df[(df["date"].apply(lambda d: d.year) == year) &
-                  (df["date"].apply(lambda d: d.month) == month)]
+    # ── 월 네비게이션 ─────────────────────────────────────────────────────────
+    if "cal_year"  not in st.session_state: st.session_state.cal_year  = today.year
+    if "cal_month" not in st.session_state: st.session_state.cal_month = today.month
+    if "cal_sel"   not in st.session_state: st.session_state.cal_sel   = None
 
-    trained_dates = set(month_df["date"].tolist())
+    year  = st.session_state.cal_year
+    month = st.session_state.cal_month
 
-    cal = calendar.monthcalendar(year, month)
-    day_names = ["월", "화", "수", "목", "금", "토", "일"]
+    nc1, nc2, nc3 = st.columns([1, 4, 1])
+    with nc1:
+        if st.button("◀ 이전달", key="cal_prev"):
+            if month == 1: st.session_state.cal_year -= 1; st.session_state.cal_month = 12
+            else:           st.session_state.cal_month -= 1
+            st.session_state.cal_sel = None
+            st.rerun()
+    nc2.markdown(
+        f"<h3 style='text-align:center;margin:4px 0'>{year}년 {month}월</h3>",
+        unsafe_allow_html=True,
+    )
+    with nc3:
+        if st.button("다음달 ▶", key="cal_next"):
+            if month == 12: st.session_state.cal_year += 1; st.session_state.cal_month = 1
+            else:            st.session_state.cal_month += 1
+            st.session_state.cal_sel = None
+            st.rerun()
 
-    header_cols = st.columns(7)
-    for i, d in enumerate(day_names):
-        header_cols[i].markdown(f"<center><b>{d}</b></center>", unsafe_allow_html=True)
+    # ── 데이터 준비 ───────────────────────────────────────────────────────────
+    df_c = df.copy()
+    df_c["date"] = pd.to_datetime(df_c["date"]).dt.date
+    mdf = df_c[
+        (df_c["date"].apply(lambda d: d.year)  == year) &
+        (df_c["date"].apply(lambda d: d.month) == month)
+    ]
 
-    for week in cal:
-        cols = st.columns(7)
-        for i, day in enumerate(week):
-            if day == 0:
-                cols[i].write("")
-            else:
-                d = date(year, month, day)
-                label = f"**{day}**" if d == today else str(day)
-                if d in trained_dates:
-                    cols[i].markdown(f"<div style='background:#1f77b4;border-radius:4px;text-align:center;color:white'>{label} 🏃</div>", unsafe_allow_html=True)
+    date_recs: dict = {}
+    for _, row in mdf.iterrows():
+        date_recs.setdefault(row["date"], []).append(row.to_dict())
+
+    def zone_bg(recs):
+        if not recs: return ""
+        n  = len(recs)
+        z2 = sum((r.get("z2_pct") or 0) for r in recs) / n
+        z3 = sum((r.get("z3_pct") or 0) for r in recs) / n
+        z4 = sum((r.get("z4_pct") or 0) for r in recs) / n
+        z5 = sum((r.get("z5_pct") or 0) for r in recs) / n
+        if z4 + z5 >= 50: return "rgba(240,153,123,0.35)"
+        if z3 + z4 > z2:  return "rgba(250,199,117,0.35)"
+        if z2 >= 70:       return "rgba(159,225,203,0.35)"
+        return "rgba(181,212,244,0.25)"
+
+    def _v(val):
+        return val if (val is not None and not (isinstance(val, float) and math.isnan(val))) else None
+
+    # ── 메인 레이아웃 (달력 + 사이드 패널) ───────────────────────────────────
+    main_col, side_col = st.columns([3, 1])
+
+    with main_col:
+        cal     = calendar.monthcalendar(year, month)
+        widths  = [1, 1, 1, 1, 1, 1, 1, 1.5]
+        headers = ["월", "화", "수", "목", "금", "토", "일", "주 합계"]
+
+        hcols = st.columns(widths)
+        for i, h in enumerate(headers):
+            hcols[i].markdown(
+                f"<div style='text-align:center;font-weight:700;padding:4px;"
+                f"border-bottom:2px solid #ddd'>{h}</div>",
+                unsafe_allow_html=True,
+            )
+
+        for week in cal:
+            cols      = st.columns(widths)
+            week_recs = []
+
+            for i, day in enumerate(week):
+                if day == 0:
+                    cols[i].markdown("<div style='min-height:90px'></div>", unsafe_allow_html=True)
+                    continue
+
+                d    = date(year, month, day)
+                recs = date_recs.get(d, [])
+
+                if recs:
+                    week_recs.extend(recs)
+                    bg     = zone_bg(recs)
+                    border = "2px solid #4A90D9" if d == today else "1px solid #ccc"
+                    lines  = [f"<b>{day}</b>"]
+                    for r in recs:
+                        sport  = str(r.get("sport", "")).lower()
+                        is_run = "run" in sport
+                        icon   = "🏃" if is_run else "🚴"
+                        dist   = f"{r['distance_km']:.1f}km" if _v(r.get("distance_km")) else ""
+                        hr_s   = f"{r['avg_hr']:.0f}bpm"    if _v(r.get("avg_hr"))       else ""
+                        if is_run:
+                            pace_s = fmt_pace(r.get("avg_pace"))
+                            lines.append(f"{icon} {dist}<br><small>{pace_s} {hr_s}</small>")
+                        else:
+                            pwr_s = f"{r['avg_power']:.0f}W" if _v(r.get("avg_power")) else ""
+                            lines.append(f"{icon} {dist}<br><small>{hr_s} {pwr_s}</small>")
+
+                    cols[i].markdown(
+                        f"<div style='background:{bg};border:{border};border-radius:6px;"
+                        f"padding:5px;min-height:90px;font-size:0.75em;line-height:1.5'>"
+                        + "".join(lines) + "</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if cols[i].button("📋", key=f"cal_{d}", help="상세 분석"):
+                        st.session_state.cal_sel = d
+                        st.rerun()
                 else:
-                    cols[i].markdown(f"<div style='text-align:center'>{label}</div>", unsafe_allow_html=True)
+                    style = (
+                        "font-weight:700;color:#4A90D9;border:2px solid #4A90D9;"
+                        if d == today else "color:#bbb;"
+                    )
+                    cols[i].markdown(
+                        f"<div style='text-align:center;padding:5px;min-height:90px;{style}'>{day}</div>",
+                        unsafe_allow_html=True,
+                    )
 
+            if week_recs:
+                wd   = sum((r.get("distance_km") or 0) for r in week_recs)
+                wt   = sum((r.get("duration_sec") or 0) for r in week_recs)
+                rc   = sum(1 for r in week_recs if "run" in str(r.get("sport","")).lower())
+                bc   = len(week_recs) - rc
+                parts = []
+                if bc: parts.append(f"🚴×{bc}")
+                if rc: parts.append(f"🏃×{rc}")
+                parts += [f"{wd:.1f}km", fmt_duration(wt)]
+                cols[7].markdown(
+                    "<div style='background:#f0f4f8;border-radius:6px;padding:6px;"
+                    "font-size:0.73em;min-height:90px;line-height:1.9'>"
+                    + "<br>".join(parts) + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+    # ── 사이드 패널 ───────────────────────────────────────────────────────────
+    with side_col:
+        days_in_month = calendar.monthrange(year, month)[1]
+        trained_days  = len(date_recs)
+        passed_days   = today.day if (today.year == year and today.month == month) else days_in_month
+
+        st.subheader("📆 이번 달")
+        st.metric("훈련일", f"{trained_days}일")
+        st.progress(min(trained_days / max(passed_days, 1), 1.0),
+                    text=f"{passed_days}일 경과 중")
+
+        st.markdown("---")
+        st.subheader("🏆 베스트")
+        if not mdf.empty:
+            wbpm_s  = mdf["w_per_bpm"].dropna()
+            dist_s  = mdf["distance_km"].dropna()
+            drift_s = mdf["drift"].dropna()
+            if len(wbpm_s):  st.metric("최고 W/bpm",    f"{wbpm_s.max():.3f}")
+            if len(dist_s):  st.metric("최장 거리",      f"{dist_s.max():.1f} km")
+            if len(drift_s):
+                best_i = drift_s.abs().idxmin()
+                st.metric("최저 드리프트", f"{drift_s[best_i]:+.1f}%")
+
+        st.markdown("---")
+        st.subheader("📊 주간 볼륨")
+        if not mdf.empty:
+            wvol = []
+            for wi, week in enumerate(calendar.monthcalendar(year, month)):
+                ds    = {d for d in week if d != 0}
+                wdist = sum((r["distance_km"] or 0) for _, r in mdf.iterrows() if r["date"].day in ds)
+                wvol.append({"주": f"W{wi+1}", "km": round(wdist, 1)})
+            fig_v = px.bar(pd.DataFrame(wvol), x="주", y="km",
+                           color_discrete_sequence=["#4A90D9"])
+            fig_v.update_layout(height=160, margin=dict(t=5, b=20, l=20, r=5),
+                                xaxis_title=None, yaxis_title="km")
+            st.plotly_chart(fig_v, use_container_width=True)
+
+    # ── 월간 합계 ─────────────────────────────────────────────────────────────
     st.markdown("---")
-    if not month_df.empty:
-        st.subheader(f"{year}년 {month}월 요약")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("훈련 횟수", f"{len(month_df)}회")
-        total_dist = month_df["distance_km"].sum()
-        c2.metric("총 거리", f"{total_dist:.1f} km")
-        total_time = month_df["duration_sec"].sum()
-        c3.metric("총 시간", fmt_duration(total_time))
+    if not mdf.empty:
+        st.subheader(f"📋 {year}년 {month}월 월간 요약")
+        for sport in mdf["sport"].dropna().unique():
+            sdf  = mdf[mdf["sport"] == sport]
+            icon = "🏃" if "run" in str(sport).lower() else "🚴"
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(f"{icon} {sport}", f"{len(sdf)}회")
+            c2.metric("총 거리",          f"{sdf['distance_km'].sum():.1f} km")
+            c3.metric("총 시간",          fmt_duration(sdf["duration_sec"].sum()))
+            wbpm_m = sdf["w_per_bpm"].dropna()
+            pace_m = sdf["avg_pace"].dropna()
+            if len(wbpm_m):   c4.metric("평균 W/bpm",   f"{wbpm_m.mean():.3f}")
+            elif len(pace_m): c4.metric("평균 페이스",   fmt_pace(pace_m.mean()))
+
+        pm, py = (month - 1, year) if month > 1 else (12, year - 1)
+        prev_df = df_c[
+            (df_c["date"].apply(lambda d: d.year)  == py) &
+            (df_c["date"].apply(lambda d: d.month) == pm)
+        ]
+        cw = mdf["w_per_bpm"].dropna()
+        pw = prev_df["w_per_bpm"].dropna() if not prev_df.empty else pd.Series(dtype=float)
+        if len(cw) and len(pw):
+            chg = (cw.mean() - pw.mean()) / pw.mean() * 100
+            st.metric("W/bpm 전월 대비", f"{cw.mean():.3f}", delta=f"{chg:+.1f}%")
+
+    # ── 날짜 상세 분석 ────────────────────────────────────────────────────────
+    sel_d = st.session_state.cal_sel
+    if sel_d and sel_d in date_recs:
+        st.markdown("---")
+        dcol, ccol = st.columns([5, 1])
+        dcol.subheader(f"📅 {sel_d} 상세 분석")
+        if ccol.button("✕ 닫기", key="cal_close"):
+            st.session_state.cal_sel = None
+            st.rerun()
+
+        for rec in date_recs[sel_d]:
+            sport  = str(rec.get("sport", "")).lower()
+            is_run = "run" in sport
+            icon   = "🏃" if is_run else "🚴"
+            fname  = os.path.basename(str(rec.get("filename", "")))
+            with st.expander(f"{icon} {fname} — {rec.get('sport','')}", expanded=True):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("거리",      f"{rec['distance_km']:.2f} km" if _v(rec.get("distance_km")) else "-")
+                c2.metric("시간",      fmt_duration(rec.get("duration_sec")))
+                c3.metric("평균 심박", f"{rec['avg_hr']:.0f} bpm"     if _v(rec.get("avg_hr"))       else "-")
+                if is_run:
+                    c4.metric("평균 페이스", fmt_pace(rec.get("avg_pace")))
+                else:
+                    c4.metric("평균 파워", f"{rec['avg_power']:.0f} W" if _v(rec.get("avg_power")) else "-")
+
+                z_vals = [rec.get(f"z{i}_pct") or 0 for i in range(1, 6)]
+                if any(v > 0 for v in z_vals):
+                    fig_z = go.Figure(go.Bar(
+                        x=ZONE_NAMES, y=z_vals, marker_color=ZONE_COLORS,
+                        text=[f"{v:.1f}%" for v in z_vals], textposition="outside",
+                    ))
+                    fig_z.update_layout(
+                        yaxis=dict(title="%", range=[0, max(z_vals) * 1.3 + 5]),
+                        height=200, margin=dict(t=20, b=10, l=10, r=10), showlegend=False,
+                    )
+                    st.plotly_chart(fig_z, use_container_width=True)
+
+                raw_df = load_raw(str(rec.get("filename", "")))
+                if not raw_df.empty and "secs" in raw_df.columns:
+                    raw_df = raw_df.copy()
+                    raw_df["min"] = (raw_df["secs"] // 60).astype(int)
+                    if is_run and {"hr", "pace"}.issubset(raw_df.columns):
+                        min_df = raw_df.groupby("min").agg(
+                            hr=("hr", "mean"), pace=("pace", "median")
+                        ).reset_index()
+                        fig_r = make_subplots(specs=[[{"secondary_y": True}]])
+                        fig_r.add_trace(go.Scatter(x=min_df["min"], y=min_df["hr"],   name="심박",   line=dict(color="#E24B4A", width=1.5)), secondary_y=False)
+                        fig_r.add_trace(go.Scatter(x=min_df["min"], y=min_df["pace"], name="페이스", line=dict(color="#4A90D9", width=1.5)), secondary_y=True)
+                        fig_r.update_yaxes(secondary_y=True, autorange="reversed")
+                        fig_r.update_layout(height=220, margin=dict(t=10,b=10,l=10,r=10),
+                                            legend=dict(orientation="h", y=1.15))
+                        st.plotly_chart(fig_r, use_container_width=True)
+                    elif not is_run and {"hr", "watts"}.issubset(raw_df.columns):
+                        min_df = raw_df.groupby("min").agg(
+                            hr=("hr", "mean"), watts=("watts", "mean")
+                        ).reset_index()
+                        fig_r = make_subplots(specs=[[{"secondary_y": True}]])
+                        fig_r.add_trace(go.Scatter(x=min_df["min"], y=min_df["hr"],    name="심박", line=dict(color="#E24B4A", width=1.5)), secondary_y=False)
+                        fig_r.add_trace(go.Scatter(x=min_df["min"], y=min_df["watts"], name="파워", line=dict(color="#4A90D9", width=1.5)), secondary_y=True)
+                        fig_r.update_layout(height=220, margin=dict(t=10,b=10,l=10,r=10),
+                                            legend=dict(orientation="h", y=1.15))
+                        st.plotly_chart(fig_r, use_container_width=True)
+
+                if is_run:
+                    laps = load_laps(str(rec.get("filename", "")))
+                    if laps:
+                        st.markdown("**km 랩**")
+                        st.dataframe(pd.DataFrame(laps), use_container_width=True, hide_index=True)
 
 
 # ── 탭 3: 훈련 기록 ────────────────────────────────────────────────────────────
