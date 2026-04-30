@@ -1177,49 +1177,209 @@ def tab_trends(df: pd.DataFrame, ftp: int):
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date")
+    today_ts = pd.Timestamp(date.today())
 
-    metric = st.selectbox("지표 선택", ["avg_hr", "avg_power", "distance_km", "w_per_bpm", "drift", "calories"],
-                          format_func=lambda x: {
-                              "avg_hr": "평균 심박수", "avg_power": "평균 파워",
-                              "distance_km": "거리", "w_per_bpm": "W/bpm 효율",
-                              "drift": "HR 드리프트", "calories": "칼로리",
-                          }.get(x, x))
+    # ── 필터 ─────────────────────────────────────────────────────────────────
+    fc1, fc2 = st.columns([3, 1])
+    period = fc1.radio("기간", ["1개월", "3개월", "6개월", "전체"], horizontal=True)
+    sports_avail = ["전체"] + sorted(df["sport"].dropna().unique().tolist())
+    sport_sel    = fc2.selectbox("종목", sports_avail)
 
-    period = st.radio("기간", ["1개월", "3개월", "6개월", "전체"], horizontal=True)
     cutoff = {"1개월": 30, "3개월": 90, "6개월": 180}.get(period)
-    plot_df = df[df["date"] >= pd.Timestamp(date.today()) - timedelta(days=cutoff)] if cutoff else df
+    pdf = df.copy()
+    if cutoff:
+        pdf = pdf[pdf["date"] >= today_ts - timedelta(days=cutoff)]
+    if sport_sel != "전체":
+        pdf = pdf[pdf["sport"] == sport_sel]
 
-    plot_df = plot_df.dropna(subset=[metric])
-    if plot_df.empty:
-        st.info("해당 기간에 데이터가 없습니다.")
+    if pdf.empty:
+        st.info("해당 조건에 데이터가 없습니다.")
         return
 
-    fig = px.scatter(plot_df, x="date", y=metric, color="sport",
-                     trendline="lowess",
-                     labels={"date": "날짜", metric: metric},
-                     title=f"{metric} 트렌드")
-    fig.update_traces(marker=dict(size=8))
-    fig.update_layout(height=400)
-    st.plotly_chart(fig, use_container_width=True)
+    # ── 훈련 부하 PMC (CTL / ATL / TSB) ──────────────────────────────────────
+    st.subheader("📈 훈련 부하 — 피트니스 / 피로 / 컨디션")
 
-    # 주간 볼륨 막대
-    st.subheader("주간 훈련 볼륨 (km)")
-    weekly = df.copy()
+    def calc_trimp(row):
+        try:
+            hr  = float(row["avg_hr"])
+            dur = float(row["duration_sec"])
+            mhr = float(row["max_hr"]) if pd.notna(row.get("max_hr")) else 185.0
+            if hr <= 0 or dur <= 0:
+                return 0.0
+            ratio = max(0.0, (hr - 50) / max(1.0, mhr - 50))
+            return (dur / 60) * ratio * math.exp(1.92 * ratio)
+        except Exception:
+            return 0.0
+
+    df["trimp"] = df.apply(calc_trimp, axis=1)
+
+    all_dates   = pd.date_range(df["date"].min(), today_ts, freq="D")
+    daily_base  = pd.DataFrame({"date": all_dates})
+    daily_trimp = df.groupby(df["date"].dt.normalize())["trimp"].sum().reset_index()
+    daily_trimp.columns = ["date", "trimp"]
+    daily_load  = daily_base.merge(daily_trimp, on="date", how="left").fillna({"trimp": 0.0})
+    daily_load  = daily_load.sort_values("date").reset_index(drop=True)
+
+    EXP_CTL = math.exp(-1 / 42)
+    EXP_ATL = math.exp(-1 / 7)
+    K_CTL   = 1 - EXP_CTL
+    K_ATL   = 1 - EXP_ATL
+    ctls, atls, ctl_v, atl_v = [], [], 0.0, 0.0
+    for t in daily_load["trimp"]:
+        ctl_v = ctl_v * EXP_CTL + t * K_CTL
+        atl_v = atl_v * EXP_ATL + t * K_ATL
+        ctls.append(round(ctl_v, 2))
+        atls.append(round(atl_v, 2))
+
+    daily_load["CTL"] = ctls
+    daily_load["ATL"] = atls
+    daily_load["TSB"] = daily_load["CTL"] - daily_load["ATL"]
+    plot_load = daily_load[daily_load["date"] >= today_ts - timedelta(days=cutoff)] if cutoff else daily_load
+
+    fig_pmc = go.Figure()
+    fig_pmc.add_trace(go.Scatter(
+        x=plot_load["date"], y=plot_load["CTL"],
+        name="CTL 피트니스", line=dict(color="#4A90D9", width=2.5),
+    ))
+    fig_pmc.add_trace(go.Scatter(
+        x=plot_load["date"], y=plot_load["ATL"],
+        name="ATL 피로", line=dict(color="#E24B4A", width=2.5),
+    ))
+    fig_pmc.add_trace(go.Scatter(
+        x=plot_load["date"], y=plot_load["TSB"],
+        name="TSB 컨디션", line=dict(color="#27AE60", width=2),
+        fill="tozeroy", fillcolor="rgba(39,174,96,0.1)",
+    ))
+    fig_pmc.add_hline(y=0, line_dash="dot", line_color="#aaa", line_width=1)
+    fig_pmc.update_layout(
+        height=340, margin=dict(t=20, b=10, l=10, r=10),
+        legend=dict(orientation="h", y=1.12),
+        yaxis_title="TRIMP 부하 점수",
+    )
+    st.plotly_chart(fig_pmc, use_container_width=True)
+    st.caption(
+        "CTL(파란): 42일 누적 장기 피트니스  ·  "
+        "ATL(빨간): 7일 누적 단기 피로  ·  "
+        "TSB(초록): CTL − ATL  →  양수 = 컨디션 좋음 / 음수 = 피로 누적"
+    )
+
+    st.markdown("---")
+
+    # ── 지표 트렌드 ──────────────────────────────────────────────────────────
+    st.subheader("📉 지표 트렌드")
+    metric_opts = {
+        "avg_hr":      "평균 심박수 (bpm)",
+        "avg_power":   "평균 파워 (W)",
+        "distance_km": "거리 (km)",
+        "w_per_bpm":   "W/bpm 효율",
+        "drift":       "HR 드리프트 (%)",
+        "avg_pace":    "평균 페이스 (초/km)",
+        "calories":    "칼로리",
+    }
+    metric = st.selectbox("지표 선택", list(metric_opts.keys()),
+                          format_func=lambda x: metric_opts[x])
+    plot_m = pdf.dropna(subset=[metric])
+    if not plot_m.empty:
+        fig_m = px.scatter(
+            plot_m, x="date", y=metric, color="sport",
+            trendline="lowess",
+            labels={"date": "날짜", metric: metric_opts[metric]},
+            color_discrete_sequence=["#4A90D9", "#E24B4A", "#FAC775"],
+        )
+        fig_m.update_traces(marker=dict(size=7))
+        fig_m.update_layout(
+            height=300, margin=dict(t=20, b=10),
+            legend=dict(y=1.1, orientation="h"),
+        )
+        if metric == "avg_pace":
+            fig_m.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig_m, use_container_width=True)
+    else:
+        st.info("해당 기간·종목에 데이터가 없습니다.")
+
+    st.markdown("---")
+
+    # ── 주간 볼륨 ────────────────────────────────────────────────────────────
+    st.subheader("📊 주간 훈련 볼륨")
+    weekly = pdf.copy()
     weekly["week"] = weekly["date"].dt.to_period("W").dt.start_time
-    weekly_sum = weekly.groupby("week")["distance_km"].sum().reset_index()
-    if cutoff:
-        weekly_sum = weekly_sum[weekly_sum["week"] >= pd.Timestamp(date.today()) - timedelta(days=cutoff)]
-    fig2 = px.bar(weekly_sum, x="week", y="distance_km", labels={"week": "주", "distance_km": "거리 (km)"})
-    fig2.update_layout(height=300)
-    st.plotly_chart(fig2, use_container_width=True)
+    weekly_grp = weekly.groupby(["week", "sport"])["distance_km"].sum().reset_index()
+    if not weekly_grp.empty:
+        fig_w = px.bar(
+            weekly_grp, x="week", y="distance_km", color="sport", barmode="stack",
+            labels={"week": "주", "distance_km": "거리 (km)", "sport": "종목"},
+            color_discrete_sequence=["#4A90D9", "#E24B4A", "#FAC775"],
+        )
+        fig_w.update_layout(height=260, margin=dict(t=20, b=10),
+                            legend=dict(y=1.1, orientation="h"))
+        st.plotly_chart(fig_w, use_container_width=True)
 
-    # 종목별 비율
-    st.subheader("종목별 훈련 비율")
-    sport_cnt = df["sport"].value_counts().reset_index()
-    sport_cnt.columns = ["sport", "count"]
-    fig3 = px.pie(sport_cnt, names="sport", values="count", hole=0.4)
-    fig3.update_layout(height=300)
-    st.plotly_chart(fig3, use_container_width=True)
+    st.markdown("---")
+
+    # ── 심박 존 분포 트렌드 (월별 누적 스택 바) ──────────────────────────────
+    st.subheader("🎯 심박 존 분포 트렌드 (월별)")
+    zone_df = pdf.copy()
+    zone_df["month"] = zone_df["date"].dt.to_period("M").astype(str)
+    zone_cols    = ["z1_pct", "z2_pct", "z3_pct", "z4_pct", "z5_pct"]
+    zone_monthly = zone_df.groupby("month")[zone_cols].mean().reset_index()
+    if not zone_monthly.empty and zone_monthly[zone_cols].sum().sum() > 0:
+        zone_long = zone_monthly.melt(
+            id_vars="month", value_vars=zone_cols,
+            var_name="zone", value_name="pct",
+        )
+        zone_long["zone"] = zone_long["zone"].map(
+            {z: n for z, n in zip(zone_cols, ZONE_NAMES)}
+        )
+        fig_zt = px.bar(
+            zone_long, x="month", y="pct", color="zone", barmode="stack",
+            color_discrete_map={n: c for n, c in zip(ZONE_NAMES, ZONE_COLORS)},
+            labels={"month": "월", "pct": "비율 (%)", "zone": "존"},
+        )
+        fig_zt.update_layout(height=260, margin=dict(t=20, b=10),
+                             legend=dict(y=1.15, orientation="h"))
+        st.plotly_chart(fig_zt, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── 종목 비율 + 개인 기록 ────────────────────────────────────────────────
+    pie_col, pr_col = st.columns([1, 2])
+
+    with pie_col:
+        st.subheader("🥧 종목 비율")
+        sport_cnt = df["sport"].value_counts().reset_index()
+        sport_cnt.columns = ["sport", "count"]
+        fig_pie = px.pie(sport_cnt, names="sport", values="count", hole=0.4,
+                         color_discrete_sequence=["#4A90D9", "#E24B4A", "#FAC775"])
+        fig_pie.update_layout(height=240, margin=dict(t=20, b=5, l=5, r=5))
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with pr_col:
+        st.subheader("🏅 개인 기록 (전체 기간)")
+        pr_c, pr_r = st.columns(2)
+        with pr_c:
+            st.markdown("**🚴 사이클링**")
+            cdf = df[df["sport"].str.lower().str.contains("cycl|bike|cycling", na=False)]
+            if not cdf.empty:
+                wbpm_c = cdf["w_per_bpm"].dropna()
+                pwr_c  = cdf["avg_power"].dropna()
+                dist_c = cdf["distance_km"].dropna()
+                if len(wbpm_c): st.metric("최고 W/bpm",    f"{wbpm_c.max():.3f}")
+                if len(pwr_c):  st.metric("최고 평균 파워", f"{pwr_c.max():.0f} W")
+                if len(dist_c): st.metric("최장 라이드",    f"{dist_c.max():.1f} km")
+            else:
+                st.info("기록 없음")
+        with pr_r:
+            st.markdown("**🏃 러닝**")
+            rdf = df[df["sport"].str.lower().str.contains("run", na=False)]
+            if not rdf.empty:
+                pace_r = rdf["avg_pace"].dropna()
+                dist_r = rdf["distance_km"].dropna()
+                hr_r   = rdf["avg_hr"].dropna()
+                if len(pace_r): st.metric("최고 평균 페이스", fmt_pace(pace_r.min()))
+                if len(dist_r): st.metric("최장 런",          f"{dist_r.max():.1f} km")
+                if len(hr_r):   st.metric("최저 평균 심박",   f"{hr_r.min():.0f} bpm")
+            else:
+                st.info("기록 없음")
 
 
 # ── 탭 5: 리포트 ───────────────────────────────────────────────────────────────
