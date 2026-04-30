@@ -593,76 +593,6 @@ def sidebar():
     max_hr = st.sidebar.number_input("최대 심박수 (bpm)", min_value=100, max_value=220, value=185, step=1)
     ftp = st.sidebar.number_input("FTP (watts)", min_value=50, max_value=500, value=170, step=5)
 
-    # ── 폴더 선택기 ────────────────────────────────────────────────────────────
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("감시 폴더")
-
-    if "watch_dir" not in st.session_state:
-        st.session_state["watch_dir"] = os.path.expanduser("~/Downloads")
-
-    # Windows 탐색기로 폴더 선택
-    if st.sidebar.button("📂 폴더 선택 (탐색기)", use_container_width=True):
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.wm_attributes("-topmost", True)
-            folder = filedialog.askdirectory(
-                title="감시 폴더 선택",
-                initialdir=st.session_state["watch_dir"],
-            )
-            root.destroy()
-            if folder:
-                st.session_state["watch_dir"] = folder
-                st.rerun()
-        except Exception as e:
-            st.sidebar.error(f"탐색기 오류: {e}")
-
-    # 바로가기 버튼
-    quick = {"🖥️ 바탕화면": "~/Desktop", "📥 다운로드": "~/Downloads", "📄 문서": "~/Documents"}
-    q_cols = st.sidebar.columns(3)
-    for i, (label, path) in enumerate(quick.items()):
-        exp = os.path.expanduser(path)
-        if os.path.isdir(exp):
-            if q_cols[i].button(label, use_container_width=True):
-                st.session_state["watch_dir"] = exp
-                st.rerun()
-
-    # 텍스트 직접 입력
-    typed = st.sidebar.text_input("경로 직접 입력", value=st.session_state["watch_dir"])
-    if typed != st.session_state["watch_dir"]:
-        st.session_state["watch_dir"] = typed
-
-    watch_dir = st.session_state["watch_dir"]
-
-    # 하위 폴더 탐색
-    if os.path.isdir(watch_dir):
-        try:
-            subdirs = sorted([
-                d for d in os.listdir(watch_dir)
-                if os.path.isdir(os.path.join(watch_dir, d)) and not d.startswith(".")
-            ])
-            if subdirs:
-                sel_sub = st.sidebar.selectbox("📁 하위 폴더", ["(현재 폴더)"] + subdirs)
-                if sel_sub != "(현재 폴더)":
-                    new_path = os.path.join(watch_dir, sel_sub)
-                    if st.sidebar.button("이 폴더 선택", use_container_width=True):
-                        st.session_state["watch_dir"] = new_path
-                        watch_dir = new_path
-                        st.rerun()
-        except PermissionError:
-            pass
-
-        # 훈련 파일 개수 표시
-        try:
-            found = [f for f in os.listdir(watch_dir) if f.lower().endswith((".fit", ".gpx", ".csv"))]
-            st.sidebar.caption(f"훈련 파일 {len(found)}개 감지됨")
-        except PermissionError:
-            pass
-    else:
-        st.sidebar.warning("폴더를 찾을 수 없습니다.")
-
     st.sidebar.markdown("---")
     st.sidebar.subheader("파일 업로드")
     uploaded = st.sidebar.file_uploader(
@@ -682,22 +612,7 @@ def sidebar():
             else:
                 st.sidebar.warning(f"⚠️ {uf.name} 파싱 실패")
 
-    st.sidebar.markdown("---")
-    if st.sidebar.button("폴더 스캔"):
-        if os.path.isdir(watch_dir):
-            count = 0
-            for fname in os.listdir(watch_dir):
-                if fname.lower().endswith((".fit", ".gpx", ".csv")):
-                    fpath = os.path.join(watch_dir, fname)
-                    data = parse_file(fpath, max_hr, ftp)
-                    if data:
-                        save_record(data)
-                        count += 1
-            st.sidebar.success(f"{count}개 파일 처리 완료")
-        else:
-            st.sidebar.error("폴더를 찾을 수 없습니다.")
-
-    return max_hr, ftp, watch_dir
+    return max_hr, ftp
 
 
 # ── 코칭 피드백 ─────────────────────────────────────────────────────────────────
@@ -996,49 +911,31 @@ def tab_records(df: pd.DataFrame):
         st.info("저장된 훈련 기록이 없습니다.")
         return
 
-    # 필터
     sports = ["전체"] + sorted(df["sport"].dropna().unique().tolist())
     sport_filter = st.selectbox("종목 필터", sports)
     filtered = df if sport_filter == "전체" else df[df["sport"] == sport_filter]
 
-    display_cols = {
-        "id": "ID", "date": "날짜", "sport": "종목", "distance_km": "거리(km)",
-        "duration_sec": "시간", "avg_hr": "평균HR", "max_hr": "최대HR",
-        "avg_power": "평균W", "avg_pace": "평균페이스", "calories": "칼로리",
-        "w_per_bpm": "W/bpm", "drift": "드리프트%",
-    }
+    if filtered.empty:
+        st.info("해당 종목의 기록이 없습니다.")
+        return
 
-    show = filtered[[c for c in display_cols.keys() if c in filtered.columns]].copy()
-    show["duration_sec"] = show["duration_sec"].apply(fmt_duration)
-    show["avg_pace"]     = show["avg_pace"].apply(fmt_pace)
-    show.columns = [display_cols.get(c, c) for c in show.columns]
-
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-    # ── 일괄 삭제 ──────────────────────────────────────────────────────────────
+    hc = st.columns([1.2, 1.8, 1, 1.2, 1.2, 1, 0.6])
+    for col, label in zip(hc, ["날짜", "파일명", "종목", "거리(km)", "시간", "평균HR", ""]):
+        col.markdown(f"**{label}**")
     st.markdown("---")
-    st.subheader("기록 삭제")
 
-    id_to_label = {
-        row["id"]: f"{row['date']}  |  {row['sport']}  |  {row.get('distance_km') or '-'} km  |  {os.path.basename(str(row.get('filename','')))}'"
-        for _, row in filtered.iterrows()
-    }
-
-    selected_ids = st.multiselect(
-        "삭제할 기록 선택 (복수 선택 가능)",
-        options=list(id_to_label.keys()),
-        format_func=lambda x: id_to_label[x],
-    )
-
-    if selected_ids:
-        st.warning(f"{len(selected_ids)}개 기록이 선택됨")
-        if st.button("🗑️ 선택 기록 삭제", type="primary"):
+    for _, row in filtered.iterrows():
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([1.2, 1.8, 1, 1.2, 1.2, 1, 0.6])
+        c1.write(str(row["date"]))
+        c2.write(os.path.basename(str(row.get("filename", ""))))
+        c3.write(str(row.get("sport", "")))
+        c4.write(f"{row['distance_km']:.2f}" if row["distance_km"] else "-")
+        c5.write(fmt_duration(row["duration_sec"]))
+        c6.write(f"{row['avg_hr']:.0f}" if row["avg_hr"] else "-")
+        if c7.button("🗑️", key=f"del_{row['id']}"):
             with get_conn() as conn:
-                conn.execute(
-                    f"DELETE FROM training_log WHERE id IN ({','.join('?' * len(selected_ids))})",
-                    selected_ids,
-                )
-            st.success(f"{len(selected_ids)}개 기록 삭제 완료")
+                conn.execute("DELETE FROM training_log WHERE id = ?", (int(row["id"]),))
+                conn.execute("DELETE FROM training_raw WHERE filename = ?", (str(row["filename"]),))
             st.rerun()
 
 
@@ -1227,7 +1124,7 @@ def main():
     )
 
     init_db()
-    max_hr, ftp, watch_dir = sidebar()
+    max_hr, ftp = sidebar()
     df = load_all()
 
     tabs = st.tabs(["오늘의 훈련", "캘린더", "훈련 기록", "트렌드", "리포트", "설정"])
