@@ -6,3 +6,4 @@ pandas
 watchdog
 fpdf2
 statsmodels
+matplotlib

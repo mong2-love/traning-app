@@ -9,12 +9,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, date, timedelta
+from io import BytesIO
 import calendar
 
 ZONE_COLORS = ["#B5D4F4", "#9FE1CB", "#FAC775", "#F0997B", "#E24B4A"]
 ZONE_NAMES  = ["Z1 회복", "Z2 유산소", "Z3 템포", "Z4 역치", "Z5 최대"]
 
-DB_PATH = "training_log.db"
+DB_PATH     = "training_log.db"
+REPORTS_DIR = "reports"
 
 # ── DB 초기화 ──────────────────────────────────────────────────────────────────
 def get_conn():
@@ -1596,78 +1598,414 @@ def tab_heatmap(df: pd.DataFrame):
 
 
 
-# ── 탭 5: 리포트 ───────────────────────────────────────────────────────────────
-def tab_report(df: pd.DataFrame):
-    st.header("훈련 리포트 생성")
+# ── 리포트 헬퍼 ────────────────────────────────────────────────────────────────
+def _ensure_reports_dir():
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+
+
+def _report_filename(period_type: str, period_start: date) -> str:
+    slug = {"주간": "weekly", "월간": "monthly", "분기": "quarterly",
+            "반기": "halfyear", "연간": "annual"}.get(period_type, period_type)
+    return os.path.join(REPORTS_DIR, f"report_{slug}_{period_start.strftime('%Y-%m-%d')}.pdf")
+
+
+def _period_range(period_type: str, label: str):
+    if period_type == "주간":
+        yr, wk = int(label[:4]), int(label[6:])
+        s = date.fromisocalendar(yr, wk, 1)
+        return s, s + timedelta(days=6)
+    if period_type == "월간":
+        yr, mo = int(label[:4]), int(label[5:7])
+        s = date(yr, mo, 1)
+        return s, date(yr, mo, calendar.monthrange(yr, mo)[1])
+    if period_type == "분기":
+        yr, q = int(label[:4]), int(label[6])
+        sm, em = (q - 1) * 3 + 1, q * 3
+        return date(yr, sm, 1), date(yr, em, calendar.monthrange(yr, em)[1])
+    if period_type == "반기":
+        yr, h = int(label[:4]), int(label[6])
+        return (date(yr, 1, 1), date(yr, 6, 30)) if h == 1 else (date(yr, 7, 1), date(yr, 12, 31))
+    yr = int(label[:4])
+    return date(yr, 1, 1), date(yr, 12, 31)
+
+
+def _period_labels(df: pd.DataFrame, period_type: str) -> list:
+    dc = df.copy()
+    dc["date"] = pd.to_datetime(dc["date"]).dt.date
+    dates = sorted(dc["date"].unique(), reverse=True)
+    seen, result = set(), []
+    for d in dates:
+        if period_type == "주간":
+            iso = d.isocalendar()
+            lb = f"{iso.year}-W{iso.week:02d}"
+        elif period_type == "월간":
+            lb = f"{d.year}-{d.month:02d}"
+        elif period_type == "분기":
+            lb = f"{d.year}-Q{(d.month - 1) // 3 + 1}"
+        elif period_type == "반기":
+            lb = f"{d.year}-H{1 if d.month <= 6 else 2}"
+        else:
+            lb = str(d.year)
+        if lb not in seen:
+            seen.add(lb); result.append(lb)
+    return result
+
+
+def _coaching_summary(pf: pd.DataFrame) -> str:
+    if pf.empty:
+        return "No training data for this period."
+    lines = []
+    n = len(pf)
+    dist = pf["distance_km"].sum()
+    time_h = pf["duration_sec"].sum() / 3600
+    lines.append(f"Total {n} sessions: {dist:.1f} km, {time_h:.1f} hours.")
+
+    wbpm = pf["w_per_bpm"].dropna()
+    if len(wbpm) > 1:
+        mid = len(wbpm) // 2
+        a1, a2 = wbpm.iloc[:mid].mean(), wbpm.iloc[mid:].mean()
+        if a2 > a1 * 1.03:
+            lines.append(f"W/bpm efficiency trending up ({a1:.2f} to {a2:.2f}). Great fitness gains!")
+        elif a2 < a1 * 0.97:
+            lines.append(f"W/bpm efficiency declining ({a1:.2f} to {a2:.2f}). Consider extra recovery.")
+        else:
+            lines.append(f"W/bpm efficiency stable at {wbpm.mean():.2f}. Consistent training!")
+    elif len(wbpm) == 1:
+        lines.append(f"W/bpm efficiency: {wbpm.iloc[0]:.2f}.")
+
+    drift = pf["drift"].dropna()
+    if len(drift) > 0:
+        avg_d = drift.mean()
+        if abs(avg_d) <= 5:
+            lines.append("HR drift is low — excellent pacing control.")
+        elif abs(avg_d) <= 10:
+            lines.append(f"Average HR drift {avg_d:+.1f}%. Monitor hydration and even pacing.")
+        else:
+            lines.append(f"High HR drift ({avg_d:+.1f}%). Reduce starting intensity or improve recovery.")
+
+    z2_avg  = pf["z2_pct"].mean()
+    z45_avg = (pf["z4_pct"] + pf["z5_pct"]).mean()
+    if not pd.isna(z2_avg)  and z2_avg  > 60:
+        lines.append(f"Z2 aerobic focus {z2_avg:.0f}% — excellent base-building approach.")
+    if not pd.isna(z45_avg) and z45_avg > 30:
+        lines.append(f"High intensity {z45_avg:.0f}% — ensure adequate recovery between hard sessions.")
+    return " ".join(lines)
+
+
+def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
+                        period_start: date, period_end: date) -> bytes:
+    import matplotlib
+    try:
+        matplotlib.use('Agg')
+    except Exception:
+        pass
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+
+    # Korean font for matplotlib
+    try:
+        import matplotlib.font_manager as fm
+        for fn_name in ['Malgun Gothic', 'NanumGothic', 'Apple SD Gothic Neo', 'AppleGothic']:
+            if any(f.name == fn_name for f in fm.fontManager.ttflist):
+                plt.rcParams['font.family'] = fn_name
+                break
+    except Exception:
+        pass
+    plt.rcParams['axes.unicode_minus'] = False
+
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # Korean font for fpdf2
+    kr_font = None
+    for fp in [
+        r"C:\Windows\Fonts\malgunsl.ttf", r"C:\Windows\Fonts\malgun.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    ]:
+        if os.path.exists(fp):
+            try:
+                pdf.add_font("KR", "", fp, uni=True)
+                kr_font = "KR"
+                break
+            except Exception:
+                pass
+
+    def fnt(sz): return (kr_font or "Helvetica"), sz
+
+    def _add_chart(fig, h=52):
+        try:
+            buf = BytesIO()
+            fig.savefig(buf, format='png', dpi=130, bbox_inches='tight',
+                        facecolor='white', edgecolor='none')
+            plt.close(fig)
+            buf.seek(0)
+            tmp = os.path.join(tempfile.gettempdir(), f"rpt_{id(fig)}.png")
+            with open(tmp, 'wb') as fo:
+                fo.write(buf.read())
+            pdf.image(tmp, x=15, y=pdf.get_y(), w=170, h=h)
+            pdf.ln(h + 3)
+            try: os.remove(tmp)
+            except: pass
+        except Exception as e:
+            plt.close(fig)
+            pdf.set_font(*fnt(8))
+            pdf.cell(0, 5, f"[Chart error: {e}]", ln=True)
+
+    pf = period_df.copy()
+    pf["date"]   = pd.to_datetime(pf["date"])
+    pf["date_d"] = pf["date"].dt.date
+
+    type_en = {"주간": "Weekly", "월간": "Monthly", "분기": "Quarterly",
+               "반기": "Semi-Annual", "연간": "Annual"}
+
+    # ── PAGE 1 : Title + Summary + W/bpm + Drift ─────────────────────────────
+    pdf.add_page()
+    pdf.set_font(*fnt(20)); pdf.set_text_color(30, 30, 30)
+    pdf.cell(0, 12, f"Training Report  —  {type_en.get(period_type, period_type)}", ln=True, align="C")
+    pdf.set_font(*fnt(10)); pdf.set_text_color(110, 110, 110)
+    pdf.cell(0, 6, f"{period_start.strftime('%Y-%m-%d')}  ~  {period_end.strftime('%Y-%m-%d')}", ln=True, align="C")
+    pdf.cell(0, 4, f"Generated: {date.today()}", ln=True, align="C")
+    pdf.ln(6)
+
+    # Summary row
+    n_sess = len(pf)
+    tot_d  = pf["distance_km"].sum()
+    tot_t  = pf["duration_sec"].sum()
+    avg_hr = pf["avg_hr"].dropna().mean()
+    avg_wb = pf["w_per_bpm"].dropna().mean()
+    items  = [
+        ("Sessions",  str(n_sess)),
+        ("Distance",  f"{tot_d:.1f} km"),
+        ("Time",      fmt_duration(int(tot_t))),
+        ("Avg HR",    f"{avg_hr:.0f} bpm" if not pd.isna(avg_hr) else "-"),
+        ("Avg W/bpm", f"{avg_wb:.3f}"     if not pd.isna(avg_wb) else "-"),
+    ]
+    pdf.set_fill_color(245, 247, 250); pdf.set_draw_color(210, 215, 220)
+    box_y = pdf.get_y(); cw = 36
+    pdf.rect(15, box_y, 180, 22, 'FD')
+    for i, (lbl, val) in enumerate(items):
+        x = 15 + i * cw
+        pdf.set_xy(x, box_y + 3); pdf.set_font(*fnt(8)); pdf.set_text_color(120, 120, 120)
+        pdf.cell(cw, 5, lbl, align="C")
+        pdf.set_xy(x, box_y + 10); pdf.set_font(*fnt(11)); pdf.set_text_color(30, 30, 30)
+        pdf.cell(cw, 7, val, align="C")
+    pdf.set_y(box_y + 26)
+
+    # W/bpm chart
+    pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
+    pdf.cell(0, 8, "W/bpm Efficiency Trend", ln=True)
+    wbpm_d = pf.dropna(subset=["w_per_bpm"])
+    if not wbpm_d.empty:
+        fig, ax = plt.subplots(figsize=(7, 2.2))
+        for indoor, color, label in [(1, '#4A90D9', 'Indoor'), (0, '#27AE60', 'Outdoor')]:
+            sub = wbpm_d[wbpm_d["indoor"] == indoor]
+            if not sub.empty:
+                ax.plot(sub["date_d"], sub["w_per_bpm"], 'o-', color=color,
+                        label=label, linewidth=1.5, markersize=4)
+        ax.set_ylabel("W/bpm", fontsize=8); ax.tick_params(labelsize=7)
+        ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+        if wbpm_d["indoor"].nunique() > 1: ax.legend(fontsize=7)
+        fig.tight_layout(pad=0.5); _add_chart(fig, h=52)
+    else:
+        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "No W/bpm data.", ln=True)
+
+    # Drift chart
+    pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
+    pdf.cell(0, 8, "HR Drift Trend", ln=True)
+    drift_d = pf.dropna(subset=["drift"])
+    if not drift_d.empty:
+        fig, ax = plt.subplots(figsize=(7, 2.2))
+        colors = ['#27AE60' if abs(v) <= 7 else '#F39C12' if abs(v) <= 10 else '#E24B4A'
+                  for v in drift_d["drift"]]
+        ax.bar(drift_d["date_d"], drift_d["drift"], color=colors, width=0.6)
+        ax.axhline(0, color='#bbb', linewidth=0.8, linestyle='--')
+        ax.set_ylabel("Drift %", fontsize=8); ax.tick_params(labelsize=7)
+        ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+        handles = [mpatches.Patch(color='#27AE60', label='Stable ≤7%'),
+                   mpatches.Patch(color='#F39C12', label='Caution 7-10%'),
+                   mpatches.Patch(color='#E24B4A', label='High >10%')]
+        ax.legend(handles=handles, fontsize=7)
+        fig.tight_layout(pad=0.5); _add_chart(fig, h=52)
+    else:
+        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "No drift data.", ln=True)
+
+    # ── PAGE 2 : Zone Distribution + Weekly Volume ────────────────────────────
+    pdf.add_page()
+
+    # Zone distribution (bar + pie)
+    pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
+    pdf.cell(0, 8, "HR Zone Distribution  (cumulative average)", ln=True)
+    zone_cols  = ["z1_pct", "z2_pct", "z3_pct", "z4_pct", "z5_pct"]
+    zone_avgs  = [0.0 if pd.isna(pf[c].mean()) else float(pf[c].mean()) for c in zone_cols]
+    zone_en    = ["Z1 Recovery", "Z2 Aerobic", "Z3 Tempo", "Z4 Threshold", "Z5 Max"]
+    z_colors   = ["#B5D4F4", "#9FE1CB", "#FAC775", "#F0997B", "#E24B4A"]
+    if sum(zone_avgs) > 0:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7, 2.5))
+        bars = ax1.bar(["Z1","Z2","Z3","Z4","Z5"], zone_avgs, color=z_colors)
+        ax1.set_ylabel("Avg %", fontsize=7); ax1.tick_params(labelsize=7)
+        ax1.spines['top'].set_visible(False); ax1.spines['right'].set_visible(False)
+        for bar, val in zip(bars, zone_avgs):
+            if val > 0.5:
+                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                         f'{val:.0f}%', ha='center', va='bottom', fontsize=6)
+        nz = [(n, v, c) for n, v, c in zip(zone_en, zone_avgs, z_colors) if v > 0]
+        if nz:
+            ns, vs, cs = zip(*nz)
+            ax2.pie(vs, labels=None, colors=cs, autopct='%1.0f%%',
+                    pctdistance=0.7, textprops={'fontsize': 6})
+            ax2.legend(ns, loc='center left', bbox_to_anchor=(1, 0.5), fontsize=5.5)
+        fig.tight_layout(pad=0.3); _add_chart(fig, h=60)
+    else:
+        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "No zone data.", ln=True)
+
+    # Weekly volume
+    pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
+    pdf.cell(0, 8, "Weekly Training Volume", ln=True)
+    wv = pf.copy()
+    wv["week_start"] = wv["date_d"].apply(lambda d: d - timedelta(days=d.weekday()))
+    wgrp = wv.groupby("week_start").agg(
+        dist=("distance_km", "sum"),
+        n_run=("sport", lambda x: sum(1 for s in x if "run" in str(s).lower())),
+        n_cyc=("sport", lambda x: sum(1 for s in x if "run" not in str(s).lower())),
+    ).reset_index()
+    if not wgrp.empty:
+        fig, ax = plt.subplots(figsize=(7, 2.2))
+        xlabels = [d.strftime("%m/%d") for d in wgrp["week_start"]]
+        ax.bar(xlabels, wgrp["dist"], color='#4A90D9')
+        for xi, (_, row) in enumerate(wgrp.iterrows()):
+            parts = []
+            if row["n_cyc"] > 0: parts.append(f"C{int(row['n_cyc'])}")
+            if row["n_run"] > 0: parts.append(f"R{int(row['n_run'])}")
+            if parts:
+                ax.text(xi, row["dist"] + 0.2, " ".join(parts),
+                        ha='center', va='bottom', fontsize=7)
+        ax.set_ylabel("km", fontsize=8); ax.tick_params(labelsize=7)
+        ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+        fig.tight_layout(pad=0.5); _add_chart(fig, h=52)
+    else:
+        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "No data.", ln=True)
+
+    # ── PAGE 3 : Best Records + Coaching Summary ──────────────────────────────
+    pdf.add_page()
+    pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
+    pdf.cell(0, 8, "Best Records", ln=True)
+
+    best_wb   = pf["w_per_bpm"].dropna()
+    best_dist = pf["distance_km"].dropna()
+    best_dr   = pf["drift"].dropna()
+    best_pwr  = pf["avg_power"].dropna()
+    best_pace = pf["avg_pace"].dropna()
+    bests = [
+        ("Best W/bpm",       f"{best_wb.max():.3f}"     if len(best_wb)   else "-"),
+        ("Longest Distance", f"{best_dist.max():.1f} km" if len(best_dist) else "-"),
+        ("Best HR Drift",    f"{best_dr.abs().min():.1f}%" if len(best_dr) else "-"),
+        ("Best Avg Power",   f"{best_pwr.max():.0f} W"  if len(best_pwr)  else "-"),
+        ("Best Avg Pace",    fmt_pace(best_pace.min())   if len(best_pace) else "-"),
+        ("Total Sessions",   str(n_sess)),
+    ]
+    pdf.set_fill_color(248, 249, 251); pdf.set_draw_color(215, 220, 225)
+    box_y = pdf.get_y(); cw2 = 58; rh = 18
+    for i, (lbl, val) in enumerate(bests):
+        cx = 15 + (i % 3) * (cw2 + 2)
+        cy = box_y + (i // 3) * (rh + 2)
+        pdf.rect(cx, cy, cw2, rh, 'FD')
+        pdf.set_xy(cx + 2, cy + 2); pdf.set_font(*fnt(8)); pdf.set_text_color(130, 130, 130)
+        pdf.cell(cw2 - 4, 5, lbl)
+        pdf.set_xy(cx + 2, cy + 8); pdf.set_font(*fnt(11)); pdf.set_text_color(30, 30, 30)
+        pdf.cell(cw2 - 4, 7, val)
+    pdf.set_y(box_y + ((len(bests) + 2) // 3) * (rh + 2) + 8)
+
+    # Coaching summary
+    pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
+    pdf.cell(0, 8, "Coaching Summary", ln=True)
+    summary = _coaching_summary(pf)
+    pdf.set_fill_color(252, 253, 255); pdf.set_draw_color(200, 210, 230)
+    pdf.set_text_color(50, 50, 50); pdf.set_font(*fnt(10))
+    pdf.multi_cell(180, 6, summary, border=1, fill=True)
+    pdf.ln(6)
+
+    # Footer
+    pdf.set_font(*fnt(8)); pdf.set_text_color(170, 170, 170)
+    pdf.cell(0, 5, f"Training Analysis App  |  Generated {date.today()}", align="C", ln=True)
+
+    return bytes(pdf.output())
+
+
+# ── 탭 6: 리포트 ───────────────────────────────────────────────────────────────
+def tab_report(df: pd.DataFrame, max_hr: int, ftp: int):
+    st.header("훈련 리포트")
 
     if df.empty:
         st.info("데이터가 없습니다.")
         return
 
-    try:
-        from fpdf import FPDF
-    except ImportError:
-        st.error("fpdf2 패키지가 필요합니다.")
+    _ensure_reports_dir()
+
+    # ── 리포트 생성 ─────────────────────────────────────────────────────────
+    st.subheader("📄 리포트 생성")
+    r1, r2 = st.columns(2)
+    period_type  = r1.selectbox("리포트 종류", ["주간", "월간", "분기", "반기", "연간"])
+    labels       = _period_labels(df, period_type)
+    if not labels:
+        st.info("해당 종류의 기간이 없습니다.")
         return
+    period_label = r2.selectbox("기간 선택", labels)
+    period_start, period_end = _period_range(period_type, period_label)
+    st.caption(f"대상 기간: {period_start.strftime('%Y-%m-%d')} ~ {period_end.strftime('%Y-%m-%d')}")
 
-    today = date.today()
-    date_str_series = df["date"].astype(str)
-    months_available = sorted(
-        date_str_series.str[:7].unique().tolist(), reverse=True
-    )
-    sel_month = st.selectbox("리포트 기간 (월)", months_available)
+    if st.button("📄 PDF 생성 및 저장", type="primary"):
+        df_p = df.copy()
+        df_p["date"] = pd.to_datetime(df_p["date"])
+        period_df = df_p[
+            (df_p["date"].dt.date >= period_start) &
+            (df_p["date"].dt.date <= period_end)
+        ].copy()
+        if period_df.empty:
+            st.warning("해당 기간에 훈련 데이터가 없습니다.")
+        else:
+            with st.spinner("PDF 생성 중..."):
+                try:
+                    pdf_bytes = generate_pdf_report(period_df, period_type, period_start, period_end)
+                    fpath     = _report_filename(period_type, period_start)
+                    with open(fpath, "wb") as f:
+                        f.write(pdf_bytes)
+                    st.success(f"저장 완료: `{fpath}`")
+                    st.download_button(
+                        "📥 바로 다운로드",
+                        data=pdf_bytes,
+                        file_name=os.path.basename(fpath),
+                        mime="application/pdf",
+                        key="dl_new",
+                    )
+                except Exception as e:
+                    st.error(f"생성 실패: {e}")
 
-    if st.button("PDF 리포트 생성"):
-        m_df = df[df["date"].astype(str).str.startswith(sel_month)]
-
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, f"Training Report: {sel_month}", ln=True, align="C")
-        pdf.ln(5)
-
-        pdf.set_font("Helvetica", "", 12)
-        pdf.cell(0, 8, f"Sessions: {len(m_df)}", ln=True)
-        pdf.cell(0, 8, f"Total Distance: {m_df['distance_km'].sum():.1f} km", ln=True)
-        pdf.cell(0, 8, f"Total Time: {fmt_duration(m_df['duration_sec'].sum())}", ln=True)
-        avg_hr_mean = m_df["avg_hr"].mean()
-        if not pd.isna(avg_hr_mean):
-            pdf.cell(0, 8, f"Avg Heart Rate: {avg_hr_mean:.0f} bpm", ln=True)
-        avg_pwr_mean = m_df["avg_power"].mean()
-        if not pd.isna(avg_pwr_mean):
-            pdf.cell(0, 8, f"Avg Power: {avg_pwr_mean:.0f} W", ln=True)
-        pdf.ln(5)
-
-        pdf.set_font("Helvetica", "B", 12)
-        headers = ["Date", "Sport", "Dist(km)", "Time", "AvgHR", "AvgW", "Cal"]
-        col_w = [28, 28, 25, 25, 22, 22, 22]
-        for h, w in zip(headers, col_w):
-            pdf.cell(w, 8, h, border=1, align="C")
-        pdf.ln()
-
-        pdf.set_font("Helvetica", "", 10)
-        for _, row in m_df.iterrows():
-            vals = [
-                str(row["date"]),
-                str(row["sport"] or ""),
-                f"{row['distance_km']:.1f}" if row["distance_km"] else "-",
-                fmt_duration(row["duration_sec"]),
-                f"{row['avg_hr']:.0f}" if row["avg_hr"] else "-",
-                f"{row['avg_power']:.0f}" if row["avg_power"] else "-",
-                f"{row['calories']:.0f}" if row["calories"] else "-",
-            ]
-            for v, w in zip(vals, col_w):
-                pdf.cell(w, 7, v, border=1, align="C")
-            pdf.ln()
-
-        pdf_bytes = bytes(pdf.output())
-        st.download_button(
-            label="📥 PDF 다운로드",
-            data=pdf_bytes,
-            file_name=f"training_report_{sel_month}.pdf",
-            mime="application/pdf",
-        )
-        st.success("리포트가 생성되었습니다!")
+    # ── 과거 리포트 목록 ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📂 저장된 리포트")
+    if os.path.isdir(REPORTS_DIR):
+        files = sorted([f for f in os.listdir(REPORTS_DIR) if f.endswith(".pdf")], reverse=True)
+        if files:
+            hc1, hc2, hc3 = st.columns([4, 2, 1])
+            hc1.markdown("**파일명**"); hc2.markdown("**크기 · 생성일**"); hc3.markdown("**다운로드**")
+            st.markdown("---")
+            for fname in files:
+                fpath = os.path.join(REPORTS_DIR, fname)
+                sz    = os.path.getsize(fpath) / 1024
+                mt    = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d %H:%M")
+                c1, c2, c3 = st.columns([4, 2, 1])
+                c1.write(f"📄 {fname}")
+                c2.caption(f"{sz:.0f} KB · {mt}")
+                with open(fpath, "rb") as f:
+                    c3.download_button("↓", data=f.read(), file_name=fname,
+                                       mime="application/pdf", key=f"dl_{fname}")
+        else:
+            st.info("저장된 리포트가 없습니다. 위에서 생성해주세요.")
+    else:
+        st.info("저장된 리포트가 없습니다.")
 
 
 # ── 탭 6: 설정 ─────────────────────────────────────────────────────────────────
@@ -1741,7 +2079,7 @@ def main():
     with tabs[4]:
         tab_heatmap(df)
     with tabs[5]:
-        tab_report(df)
+        tab_report(df, max_hr, ftp)
     with tabs[6]:
         tab_settings(max_hr, ftp)
 
