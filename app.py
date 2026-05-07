@@ -203,6 +203,17 @@ def parse_fit(path: str, max_hr: int, ftp: int):
     if "distance" in df.columns:
         df["km"] = pd.to_numeric(df["distance"], errors="coerce") / 1000.0
 
+    # 속도 스파이크 보정 — 전후 5분 중앙값의 2배 초과 또는 50 km/h 초과 → 전후 평균으로 대체
+    # (FIT 1Hz 기준 ±5분 = ±300샘플, 윈도우 601)
+    if "kph" in df.columns:
+        kph_num   = pd.to_numeric(df["kph"], errors="coerce")
+        roll_med5 = kph_num.rolling(window=601, center=True, min_periods=10).median()
+        spd_spike = (kph_num > roll_med5 * 2) | (kph_num > 50)
+        kph_clean = kph_num.copy()
+        kph_clean[spd_spike] = float("nan")
+        roll_fill = kph_clean.rolling(window=601, center=True, min_periods=1).mean()
+        df["kph"] = kph_clean.fillna(roll_fill)
+
     # 타임스탬프 → secs(경과초) + 날짜
     date_str     = str(date.today())
     moving_time  = None
