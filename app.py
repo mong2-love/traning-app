@@ -210,7 +210,7 @@ def parse_fit(path: str, max_hr: int, ftp: int):
         ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         valid_ts = ts.dropna()
         if len(valid_ts) > 0:
-            date_str    = valid_ts.iloc[0].to_pydatetime().astimezone().strftime("%Y-%m-%d")
+            date_str    = valid_ts.iloc[0].tz_convert("Asia/Seoul").strftime("%Y-%m-%d")
             secs        = (ts - valid_ts.iloc[0]).dt.total_seconds()
             df["secs"]  = secs
             secs_diff   = secs.diff().fillna(1.0)
