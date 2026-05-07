@@ -930,7 +930,7 @@ def tab_calendar(df: pd.DataFrame):
                 unsafe_allow_html=True,
             )
 
-        for week in cal:
+        for wi, week in enumerate(cal):
             cols      = st.columns(widths)
             week_recs = []
 
