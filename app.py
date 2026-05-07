@@ -27,27 +27,42 @@ def init_db():
     with get_conn() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS training_log (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                date          TEXT,
-                filename      TEXT UNIQUE,
-                sport         TEXT,
-                indoor        INTEGER,
-                distance_km   REAL,
-                duration_sec  INTEGER,
-                avg_hr        REAL,
-                max_hr        REAL,
-                avg_power     REAL,
-                max_power     REAL,
-                avg_cadence   REAL,
-                w_per_bpm     REAL,
-                drift         REAL,
-                z1_pct        REAL,
-                z2_pct        REAL,
-                z3_pct        REAL,
-                z4_pct        REAL,
-                z5_pct        REAL,
-                avg_pace      REAL,
-                calories      REAL
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                date            TEXT,
+                filename        TEXT UNIQUE,
+                sport           TEXT,
+                indoor          INTEGER,
+                course_name     TEXT,
+                distance_km     REAL,
+                duration_sec    INTEGER,
+                moving_time_sec INTEGER,
+                stop_time_sec   INTEGER,
+                avg_speed_kph   REAL,
+                avg_hr          REAL,
+                max_hr          REAL,
+                drift           REAL,
+                drift_grade     TEXT,
+                avg_power       REAL,
+                max_power       REAL,
+                avg_cadence     REAL,
+                w_per_bpm       REAL,
+                spike_count     INTEGER,
+                spike_corrected INTEGER,
+                z1_pct          REAL,
+                z2_pct          REAL,
+                z3_pct          REAL,
+                z4_pct          REAL,
+                z5_pct          REAL,
+                avg_pace        REAL,
+                best_pace       REAL,
+                pace_drift_sec  REAL,
+                calories        REAL,
+                indoor_temp     REAL,
+                cad_lt70        REAL,
+                cad_70_80       REAL,
+                cad_80_90       REAL,
+                cad_90_100      REAL,
+                cad_100p        REAL
             )
         """)
         conn.execute("""
@@ -58,10 +73,28 @@ def init_db():
             )
         """)
         # 기존 DB 마이그레이션
-        try:
-            conn.execute("ALTER TABLE training_raw ADD COLUMN laps_json TEXT")
-        except Exception:
-            pass
+        for col, tbl, typ in [
+            ("laps_json",       "training_raw", "TEXT"),
+            ("course_name",     "training_log", "TEXT"),
+            ("moving_time_sec", "training_log", "INTEGER"),
+            ("stop_time_sec",   "training_log", "INTEGER"),
+            ("avg_speed_kph",   "training_log", "REAL"),
+            ("drift_grade",     "training_log", "TEXT"),
+            ("spike_count",     "training_log", "INTEGER"),
+            ("spike_corrected", "training_log", "INTEGER"),
+            ("best_pace",       "training_log", "REAL"),
+            ("pace_drift_sec",  "training_log", "REAL"),
+            ("indoor_temp",     "training_log", "REAL"),
+            ("cad_lt70",        "training_log", "REAL"),
+            ("cad_70_80",       "training_log", "REAL"),
+            ("cad_80_90",       "training_log", "REAL"),
+            ("cad_90_100",      "training_log", "REAL"),
+            ("cad_100p",        "training_log", "REAL"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
 
 
 # ── 심박 존 계산 ────────────────────────────────────────────────────────────────
@@ -80,6 +113,29 @@ def assign_zone(bpm, zones):
         if lo <= bpm <= hi:
             return i + 1
     return 5
+
+
+def _drift_grade(drift):
+    if drift is None or (isinstance(drift, float) and math.isnan(drift)):
+        return None
+    if abs(drift) <= 4: return "정상"
+    if abs(drift) <= 8: return "주의"
+    return "피로"
+
+
+def _cad_zones(cad_series: pd.Series) -> dict:
+    cad = cad_series[cad_series > 0].dropna()
+    total = len(cad)
+    if total == 0:
+        return dict(cad_lt70=0.0, cad_70_80=0.0, cad_80_90=0.0, cad_90_100=0.0, cad_100p=0.0)
+    def pct(mask): return round(float(mask.sum()) / total * 100, 1)
+    return dict(
+        cad_lt70   = pct(cad < 70),
+        cad_70_80  = pct((cad >= 70) & (cad < 80)),
+        cad_80_90  = pct((cad >= 80) & (cad < 90)),
+        cad_90_100 = pct((cad >= 90) & (cad < 100)),
+        cad_100p   = pct(cad >= 100),
+    )
 
 
 def fmt_duration(seconds):
@@ -102,10 +158,11 @@ def fmt_pace(sec_per_km):
 # 253=timestamp, 3=heart_rate, 4=cadence, 5=distance(m),
 # 6=speed(m/s), 7=power(W), 2=altitude(m)
 _FIT_DEF_MAP  = {253: "timestamp", 3: "hr", 4: "cad",
-                 5: "distance",    6: "speed", 7: "watts", 2: "altitude"}
+                 5: "distance",    6: "speed", 7: "watts", 2: "altitude", 13: "temp"}
 _FIT_NAME_MAP = {"timestamp": "timestamp", "heart_rate": "hr", "cadence": "cad",
                  "distance": "distance",   "speed": "speed",
-                 "power": "watts",         "altitude": "altitude"}
+                 "power": "watts",         "altitude": "altitude",
+                 "temperature": "temp"}
 
 
 def parse_fit(path: str, max_hr: int, ftp: int):
@@ -160,11 +217,20 @@ def parse_fit(path: str, max_hr: int, ftp: int):
             moving_time = float(secs_diff[secs_diff < 30].sum())
 
     # 파워 스파이크 보정 — 전후 5초 중앙값의 3배 & 400W 초과 → 중앙값으로 대체
+    spike_count = 0
     if "watts" in df.columns:
         df["watts"]  = pd.to_numeric(df["watts"], errors="coerce")
         roll_med     = df["watts"].rolling(window=11, center=True, min_periods=1).median()
         spike_mask   = (df["watts"] > roll_med * 3) & (df["watts"] > 400)
+        spike_count  = int(spike_mask.sum())
         df.loc[spike_mask, "watts"] = roll_med[spike_mask]
+
+    # 실내 온도
+    indoor_temp = None
+    if "temp" in df.columns:
+        t_valid = pd.to_numeric(df["temp"], errors="coerce").dropna()
+        if len(t_valid) > 0:
+            indoor_temp = round(float(t_valid.mean()), 1)
 
     # sport / indoor
     sport = str(session_data.get("sport", "unknown")).lower()
@@ -183,8 +249,14 @@ def parse_fit(path: str, max_hr: int, ftp: int):
         if raw_dist:
             distance_km = raw_dist / 1000.0 if raw_dist > 1000 else raw_dist
 
-    # duration
-    duration_sec = moving_time or session_data.get("total_elapsed_time")
+    # duration / 이동·정지 시간
+    total_elapsed = session_data.get("total_elapsed_time")
+    duration_sec  = moving_time or total_elapsed
+    moving_time_sec = int(moving_time) if moving_time else None
+    stop_time_sec   = int(total_elapsed - moving_time) if (total_elapsed and moving_time and total_elapsed > moving_time) else None
+
+    # 코스명
+    course_name = str(session_data.get("sport_profile_name", "") or "").strip() or None
 
     # 심박
     hr_valid   = df["hr"].dropna()  if "hr"    in df.columns else pd.Series(dtype=float)
@@ -232,7 +304,30 @@ def parse_fit(path: str, max_hr: int, ftp: int):
     if distance_km and duration_sec and distance_km > 0:
         avg_pace = round(duration_sec / distance_km, 1)
 
+    # 평균 속도
+    avg_speed_kph = round(distance_km / (moving_time / 3600), 1) if (distance_km and moving_time and moving_time > 0) else None
+
     calories = session_data.get("total_calories")
+
+    # 케이던스 구간 분포
+    cad_z = _cad_zones(df["cad"]) if "cad" in df.columns else {}
+
+    # 러닝 전용 — 최고 페이스 및 페이스 드리프트
+    best_pace_val  = None
+    pace_drift_val = None
+    is_running_fit = "run" in sport
+    if is_running_fit and "kph" in df.columns:
+        kph_s   = pd.to_numeric(df["kph"], errors="coerce").dropna()
+        kph_pos = kph_s[kph_s > 0]
+        if len(kph_pos) > 20:
+            best_kph = float(kph_pos.quantile(0.95))
+            best_pace_val = round(3600 / best_kph, 1) if best_kph > 0 else None
+            pace_s = (3600 / kph_pos).replace([float("inf")], None).dropna()
+            if len(pace_s) > 20:
+                mid = len(pace_s) // 2
+                p1, p2 = pace_s.iloc[:mid].mean(), pace_s.iloc[mid:].mean()
+                if not (pd.isna(p1) or pd.isna(p2)):
+                    pace_drift_val = round(p2 - p1, 1)
 
     # 원시 데이터 저장 (차트용)
     fname     = os.path.basename(path)
@@ -245,19 +340,30 @@ def parse_fit(path: str, max_hr: int, ftp: int):
         filename=fname,
         sport=sport,
         indoor=indoor_flag,
+        course_name=course_name,
         distance_km=round(distance_km, 2) if distance_km else None,
         duration_sec=int(duration_sec)    if duration_sec else None,
+        moving_time_sec=moving_time_sec,
+        stop_time_sec=stop_time_sec,
+        avg_speed_kph=avg_speed_kph,
         avg_hr=round(avg_hr, 1)           if avg_hr       else None,
         max_hr=round(max_hr_val, 1)       if max_hr_val   else None,
+        drift=drift,
+        drift_grade=_drift_grade(drift),
         avg_power=round(avg_power, 1)     if avg_power    else None,
         max_power=round(max_power, 1)     if max_power    else None,
         avg_cadence=round(avg_cad, 1)     if avg_cad      else None,
         w_per_bpm=w_per_bpm,
-        drift=drift,
+        spike_count=spike_count,
+        spike_corrected=1 if spike_count > 0 else 0,
         z1_pct=z_pcts[0], z2_pct=z_pcts[1], z3_pct=z_pcts[2],
         z4_pct=z_pcts[3], z5_pct=z_pcts[4],
         avg_pace=avg_pace,
+        best_pace=best_pace_val,
+        pace_drift_sec=pace_drift_val,
         calories=float(calories) if calories else None,
+        indoor_temp=indoor_temp,
+        **cad_z,
     )
 
 
@@ -331,8 +437,19 @@ def parse_gpx(path: str, max_hr: int, ftp: int):
 
     # 평균/최고 페이스
     pace_valid = df["pace"].dropna() if "pace" in df.columns else pd.Series(dtype=float)
-    avg_pace   = float(pace_valid.mean())              if len(pace_valid) > 0 else None
-    best_pace  = float(pace_valid.quantile(0.05))      if len(pace_valid) > 20 else None
+    avg_pace   = float(pace_valid.mean())         if len(pace_valid) > 0  else None
+    best_pace  = float(pace_valid.quantile(0.05)) if len(pace_valid) > 20 else None
+
+    # 페이스 드리프트 (전반 vs 후반)
+    pace_drift_sec = None
+    if len(pace_valid) > 20:
+        mid = len(pace_valid) // 2
+        p1, p2 = pace_valid.iloc[:mid].mean(), pace_valid.iloc[mid:].mean()
+        if not (pd.isna(p1) or pd.isna(p2)):
+            pace_drift_sec = round(float(p2 - p1), 1)
+
+    # 평균 속도
+    avg_speed_kph = round(distance_km / (moving_time / 3600), 1) if (distance_km and moving_time and moving_time > 0) else None
 
     # 심박
     hr_valid   = df["hr"].dropna() if "hr" in df.columns else pd.Series(dtype=float)
@@ -388,16 +505,27 @@ def parse_gpx(path: str, max_hr: int, ftp: int):
         filename=fname,
         sport="running",
         indoor=0,
+        course_name=None,
         distance_km=round(distance_km, 2) if distance_km else None,
         duration_sec=int(moving_time)     if moving_time  else None,
+        moving_time_sec=int(moving_time)  if moving_time  else None,
+        stop_time_sec=None,
+        avg_speed_kph=avg_speed_kph,
         avg_hr=round(avg_hr, 1)           if avg_hr       else None,
         max_hr=round(max_hr_val, 1)       if max_hr_val   else None,
-        avg_power=None, max_power=None, avg_cadence=None, w_per_bpm=None,
         drift=drift,
+        drift_grade=_drift_grade(drift),
+        avg_power=None, max_power=None,
+        avg_cadence=None, w_per_bpm=None,
+        spike_count=0, spike_corrected=0,
         z1_pct=z_pcts[0], z2_pct=z_pcts[1], z3_pct=z_pcts[2],
         z4_pct=z_pcts[3], z5_pct=z_pcts[4],
         avg_pace=round(avg_pace, 1)       if avg_pace     else None,
+        best_pace=round(best_pace, 1)     if best_pace    else None,
+        pace_drift_sec=pace_drift_sec,
         calories=None,
+        indoor_temp=None,
+        cad_lt70=0.0, cad_70_80=0.0, cad_80_90=0.0, cad_90_100=0.0, cad_100p=0.0,
     )
 
 
@@ -465,13 +593,16 @@ def parse_csv(path: str, max_hr: int, ftp: int):
 
     # 파워 스파이크 보정 — 전후 5초 중앙값의 3배 초과 & 400W 초과 시 중앙값으로 대체
     rolling_med = df["watts"].rolling(window=11, center=True, min_periods=1).median()
-    spike_mask = (df["watts"] > rolling_med * 3) & (df["watts"] > 400)
+    spike_mask  = (df["watts"] > rolling_med * 3) & (df["watts"] > 400)
+    spike_count = int(spike_mask.sum())
     df.loc[spike_mask, "watts"] = rolling_med[spike_mask]
 
     # 이동 시간 — 30초 이상 gap은 정지로 판단
-    secs_diff = df["secs"].diff().fillna(1.0)
+    secs_diff   = df["secs"].diff().fillna(1.0)
+    total_secs  = float(df["secs"].max() - df["secs"].min()) if len(df) > 1 else 0.0
     moving_mask = secs_diff < 30
     moving_time = float(secs_diff[moving_mask].sum())
+    stop_time_sec = int(total_secs - moving_time) if total_secs > moving_time else None
 
     # 거리
     distance_km = None
@@ -528,6 +659,12 @@ def parse_csv(path: str, max_hr: int, ftp: int):
     if distance_km and moving_time and distance_km > 0:
         avg_pace = round(moving_time / distance_km, 1)
 
+    # 평균 속도
+    avg_speed_kph = round(distance_km / (moving_time / 3600), 1) if (distance_km and moving_time and moving_time > 0) else None
+
+    # 케이던스 구간 분포
+    cad_z = _cad_zones(df["cad"]) if "cad" in df.columns else {}
+
     # 날짜 — 파일 수정 시각 기준
     try:
         date_str = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d")
@@ -544,19 +681,30 @@ def parse_csv(path: str, max_hr: int, ftp: int):
         filename=fname,
         sport="cycling",
         indoor=1,
+        course_name=None,
         distance_km=round(distance_km, 2) if distance_km else None,
-        duration_sec=int(moving_time) if moving_time else None,
-        avg_hr=round(avg_hr, 1) if avg_hr else None,
-        max_hr=round(max_hr_val, 1) if max_hr_val else None,
-        avg_power=round(avg_power, 1) if avg_power else None,
-        max_power=round(max_power, 1) if max_power else None,
-        avg_cadence=round(avg_cad, 1) if avg_cad else None,
-        w_per_bpm=w_per_bpm,
+        duration_sec=int(moving_time)      if moving_time  else None,
+        moving_time_sec=int(moving_time)   if moving_time  else None,
+        stop_time_sec=stop_time_sec,
+        avg_speed_kph=avg_speed_kph,
+        avg_hr=round(avg_hr, 1)            if avg_hr       else None,
+        max_hr=round(max_hr_val, 1)        if max_hr_val   else None,
         drift=drift,
+        drift_grade=_drift_grade(drift),
+        avg_power=round(avg_power, 1)      if avg_power    else None,
+        max_power=round(max_power, 1)      if max_power    else None,
+        avg_cadence=round(avg_cad, 1)      if avg_cad      else None,
+        w_per_bpm=w_per_bpm,
+        spike_count=spike_count,
+        spike_corrected=1 if spike_count > 0 else 0,
         z1_pct=z_pcts[0], z2_pct=z_pcts[1], z3_pct=z_pcts[2],
         z4_pct=z_pcts[3], z5_pct=z_pcts[4],
         avg_pace=avg_pace,
+        best_pace=None,
+        pace_drift_sec=None,
         calories=None,
+        indoor_temp=None,
+        **cad_z,
     )
 
 
@@ -683,175 +831,27 @@ def coaching_feedback(row: dict) -> list:
     return msgs
 
 
-# ── 탭 1: 오늘의 훈련 ──────────────────────────────────────────────────────────
-def tab_today(df: pd.DataFrame, max_hr: int, ftp: int):
-    st.header("오늘의 훈련")
-    today_str = str(date.today())
-    today_df  = df[df["date"] == today_str] if not df.empty else pd.DataFrame()
+# ── 탭 1: 최근 훈련 ──────────────────────────────────────────────────────────
+def tab_recent(df: pd.DataFrame, max_hr: int, ftp: int):
+    st.header("최근 훈련")
 
-    if today_df.empty:
-        st.info("오늘 등록된 훈련 데이터가 없습니다. 사이드바에서 파일을 업로드하세요.")
+    if df.empty:
+        st.info("훈련 데이터가 없습니다. 사이드바에서 파일을 업로드하세요.")
         return
 
-    for _, row in today_df.iterrows():
-        sport      = str(row.get("sport", "")).lower()
-        is_running = "running" in sport or "run" in sport
-        raw_df     = load_raw(row["filename"])
+    df_s        = df.sort_values("date", ascending=False)
+    latest_date = str(df_s.iloc[0]["date"])
+    latest_df   = df_s[df_s["date"] == latest_date]
 
-        # 러닝 전용: 원시 데이터에서 페이스 드리프트·최고페이스 계산
-        pace_drift_sec = None
-        best_pace      = None
-        if is_running and not raw_df.empty and "pace" in raw_df.columns:
-            pv = raw_df["pace"].dropna()
-            if len(pv) > 20:
-                best_pace = float(pv.quantile(0.05))
-                mid = len(pv) // 2
-                p1, p2 = pv.iloc[:mid].mean(), pv.iloc[mid:].mean()
-                if not (pd.isna(p1) or pd.isna(p2)):
-                    pace_drift_sec = round(p2 - p1, 1)
+    st.caption(f"가장 최근 훈련일: **{latest_date}**")
+    st.markdown("---")
 
-        icon = "🏃" if is_running else "🚴"
-        with st.expander(f"{icon} {row['filename']} — {row['sport']}", expanded=True):
-
-            # ── 8개 메트릭 카드 (2×4) ─────────────────────────────────────────
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("거리",      f"{row['distance_km']:.2f} km" if row["distance_km"] else "-")
-            c2.metric("이동 시간", fmt_duration(row["duration_sec"]))
-            c3.metric("평균 심박", f"{row['avg_hr']:.0f} bpm"     if row["avg_hr"]    else "-")
-            c4.metric("최대 심박", f"{row['max_hr']:.0f} bpm"     if row["max_hr"]    else "-")
-
-            c5, c6, c7, c8 = st.columns(4)
-            drift_val = row["drift"]
-            drift_str = f"{drift_val:+.1f}%" if drift_val is not None and not pd.isna(drift_val) else "-"
-            if is_running:
-                c5.metric("평균 페이스",     fmt_pace(row["avg_pace"]) if row["avg_pace"] else "-")
-                c6.metric("최고 페이스",     fmt_pace(best_pace)        if best_pace       else "-")
-                pd_str = f"{pace_drift_sec:+.0f}초/km" if pace_drift_sec is not None else "-"
-                c7.metric("페이스 드리프트", pd_str)
-                c8.metric("HR 드리프트",     drift_str)
-            else:
-                c5.metric("평균 파워",  f"{row['avg_power']:.0f} W" if row["avg_power"] else "-")
-                c6.metric("최대 파워",  f"{row['max_power']:.0f} W" if row["max_power"] else "-")
-                c7.metric("W/bpm 효율", f"{row['w_per_bpm']:.3f}"   if row["w_per_bpm"] else "-")
-                c8.metric("HR 드리프트", drift_str)
-
-            st.markdown("---")
-
-            # ── 심박 존 분포 바 차트 (공통) ──────────────────────────────────
-            z_vals = [row.get(f"z{i}_pct") or 0 for i in range(1, 6)]
-            if any(v > 0 for v in z_vals):
-                fig_zone = go.Figure(go.Bar(
-                    x=ZONE_NAMES, y=z_vals,
-                    marker_color=ZONE_COLORS,
-                    text=[f"{v:.1f}%" for v in z_vals],
-                    textposition="outside",
-                ))
-                fig_zone.update_layout(
-                    title="심박 존 분포",
-                    yaxis=dict(title="%", range=[0, max(z_vals) * 1.25 + 5]),
-                    height=260, margin=dict(t=40, b=10, l=10, r=10), showlegend=False,
-                )
-                st.plotly_chart(fig_zone, use_container_width=True)
-
-            if is_running:
-                # ── 러닝: HR + 페이스 듀얼 차트 (페이스 Y축 역방향) ──────────
-                if not raw_df.empty and "hr" in raw_df.columns and "pace" in raw_df.columns and "secs" in raw_df.columns:
-                    raw_df["min"] = (raw_df["secs"] // 60).astype(int)
-                    min_df = raw_df.groupby("min").agg(
-                        hr=("hr", "mean"), pace=("pace", "median")
-                    ).reset_index()
-
-                    fig_run = make_subplots(specs=[[{"secondary_y": True}]])
-                    fig_run.add_trace(
-                        go.Scatter(x=min_df["min"], y=min_df["hr"],
-                                   name="심박 (bpm)", line=dict(color="#E24B4A", width=2)),
-                        secondary_y=False,
-                    )
-                    fig_run.add_trace(
-                        go.Scatter(x=min_df["min"], y=min_df["pace"],
-                                   name="페이스 (초/km)", line=dict(color="#4A90D9", width=2)),
-                        secondary_y=True,
-                    )
-                    fig_run.update_layout(
-                        title="분당 심박 & 페이스",
-                        height=280, margin=dict(t=40, b=10, l=10, r=10),
-                        legend=dict(orientation="h", y=1.12),
-                    )
-                    fig_run.update_xaxes(title_text="경과 시간 (분)")
-                    fig_run.update_yaxes(title_text="심박 (bpm)", secondary_y=False)
-                    fig_run.update_yaxes(title_text="페이스 (초/km)", secondary_y=True, autorange="reversed")
-                    st.plotly_chart(fig_run, use_container_width=True)
-
-                # ── km 랩 분석 테이블 ─────────────────────────────────────────
-                laps = load_laps(row["filename"])
-                if laps:
-                    st.subheader("📊 km 랩 분석")
-                    st.dataframe(pd.DataFrame(laps), use_container_width=True, hide_index=True)
-
-            else:
-                # ── 사이클링: HR + 파워 듀얼 차트 + 케이던스 도넛 ──────────────
-                col_charts, col_donut = st.columns([3, 1])
-                with col_charts:
-                    if not raw_df.empty and "hr" in raw_df.columns and "watts" in raw_df.columns and "secs" in raw_df.columns:
-                        raw_df["min"] = (raw_df["secs"] // 60).astype(int)
-                        min_df = raw_df.groupby("min").agg(
-                            hr=("hr", "mean"), watts=("watts", "mean")
-                        ).reset_index()
-                        fig_dual = make_subplots(specs=[[{"secondary_y": True}]])
-                        fig_dual.add_trace(
-                            go.Scatter(x=min_df["min"], y=min_df["hr"],
-                                       name="심박 (bpm)", line=dict(color="#E24B4A", width=2)),
-                            secondary_y=False,
-                        )
-                        fig_dual.add_trace(
-                            go.Scatter(x=min_df["min"], y=min_df["watts"],
-                                       name="파워 (W)", line=dict(color="#4A90D9", width=2)),
-                            secondary_y=True,
-                        )
-                        fig_dual.update_layout(
-                            title="분당 심박 & 파워",
-                            height=280, margin=dict(t=40, b=10, l=10, r=10),
-                            legend=dict(orientation="h", y=1.12),
-                        )
-                        fig_dual.update_xaxes(title_text="경과 시간 (분)")
-                        fig_dual.update_yaxes(title_text="심박 (bpm)", secondary_y=False)
-                        fig_dual.update_yaxes(title_text="파워 (W)",   secondary_y=True)
-                        st.plotly_chart(fig_dual, use_container_width=True)
-
-                with col_donut:
-                    if not raw_df.empty and "cad" in raw_df.columns:
-                        cad_s = raw_df[raw_df["cad"] > 0]["cad"].dropna()
-                        if len(cad_s) > 0:
-                            bins     = [0, 60, 70, 80, 90, 100, 9999]
-                            labels   = ["<60", "60-69", "70-79", "80-89", "90-99", "100+"]
-                            cad_cut  = pd.cut(cad_s, bins=bins, labels=labels, right=False)
-                            cad_cnt  = cad_cut.value_counts().reindex(labels, fill_value=0)
-                            cad_cols = ["#B5D4F4", "#9FE1CB", "#FAC775", "#F0997B", "#E24B4A", "#A259FF"]
-                            fig_cad  = go.Figure(go.Pie(
-                                labels=cad_cnt.index, values=cad_cnt.values,
-                                hole=0.5, marker_colors=cad_cols,
-                            ))
-                            fig_cad.update_layout(
-                                title="케이던스 분포", height=280,
-                                margin=dict(t=40, b=10, l=5, r=5),
-                                legend=dict(orientation="v", x=1.0, font=dict(size=10)),
-                            )
-                            st.plotly_chart(fig_cad, use_container_width=True)
-
-            # ── 코칭 피드백 ────────────────────────────────────────────────────
-            row_extra = dict(row)
-            if pace_drift_sec is not None:
-                row_extra["pace_drift_sec"] = pace_drift_sec
-            st.markdown("**💬 코칭 피드백**")
-            for level, msg in coaching_feedback(row_extra):
-                if level == "success":
-                    st.success(msg)
-                elif level == "warning":
-                    st.warning(msg)
-                elif level == "error":
-                    st.error(msg)
-                else:
-                    st.info(msg)
+    for _, row in latest_df.iterrows():
+        sport  = str(row.get("sport", "")).lower()
+        icon   = "🏃" if "run" in sport else "🚴"
+        fname  = os.path.basename(str(row.get("filename", "")))
+        with st.expander(f"{icon} {fname} — {row['sport']}", expanded=True):
+            show_training_detail(row, df, max_hr, ftp)
 
 
 # ── 탭 2: 캘린더 ───────────────────────────────────────────────────────────────
@@ -867,7 +867,6 @@ def tab_calendar(df: pd.DataFrame):
     # ── 월 네비게이션 ─────────────────────────────────────────────────────────
     if "cal_year"  not in st.session_state: st.session_state.cal_year  = today.year
     if "cal_month" not in st.session_state: st.session_state.cal_month = today.month
-    if "cal_sel"   not in st.session_state: st.session_state.cal_sel   = None
 
     year  = st.session_state.cal_year
     month = st.session_state.cal_month
@@ -877,7 +876,6 @@ def tab_calendar(df: pd.DataFrame):
         if st.button("◀ 이전달", key="cal_prev"):
             if month == 1: st.session_state.cal_year -= 1; st.session_state.cal_month = 12
             else:           st.session_state.cal_month -= 1
-            st.session_state.cal_sel = None
             st.rerun()
     nc2.markdown(
         f"<h3 style='text-align:center;margin:4px 0'>{year}년 {month}월</h3>",
@@ -887,7 +885,6 @@ def tab_calendar(df: pd.DataFrame):
         if st.button("다음달 ▶", key="cal_next"):
             if month == 12: st.session_state.cal_year += 1; st.session_state.cal_month = 1
             else:            st.session_state.cal_month += 1
-            st.session_state.cal_sel = None
             st.rerun()
 
     # ── 데이터 준비 ───────────────────────────────────────────────────────────
@@ -969,8 +966,10 @@ def tab_calendar(df: pd.DataFrame):
                         + "".join(lines) + "</div>",
                         unsafe_allow_html=True,
                     )
-                    if cols[i].button("📋", key=f"cal_{d}", help="상세 분석"):
-                        st.session_state.cal_sel = d
+                    if cols[i].button("📋", key=f"cal_{d}", help="훈련 기록으로 이동"):
+                        st.session_state.nav_tab = "훈련 기록"
+                        st.session_state.rec_filter_date = str(d)
+                        st.session_state.rec_detail_file = None
                         st.rerun()
                 else:
                     style = (
@@ -993,10 +992,20 @@ def tab_calendar(df: pd.DataFrame):
                 parts += [f"{wd:.1f}km", fmt_duration(wt)]
                 cols[7].markdown(
                     "<div style='background:#f0f4f8;border-radius:6px;padding:6px;"
-                    "font-size:0.73em;min-height:90px;line-height:1.9'>"
+                    "font-size:0.73em;min-height:60px;line-height:1.9'>"
                     + "<br>".join(parts) + "</div>",
                     unsafe_allow_html=True,
                 )
+                # 주간 리포트 이동 버튼
+                first_day = next((date(year, month, d) for d in week if d != 0), None)
+                if first_day:
+                    iso_y, iso_w, _ = first_day.isocalendar()
+                    wlabel = f"{iso_y}-W{iso_w:02d}"
+                    if cols[7].button("📊", key=f"cal_wrep_{wi}", help=f"{wlabel} 주간 리포트"):
+                        st.session_state.nav_tab = "리포트"
+                        st.session_state.report_preset_type  = "주간"
+                        st.session_state.report_preset_label = wlabel
+                        st.rerun()
 
     # ── 사이드 패널 ───────────────────────────────────────────────────────────
     with side_col:
@@ -1051,6 +1060,7 @@ def tab_calendar(df: pd.DataFrame):
             if len(wbpm_m):   c4.metric("평균 W/bpm",   f"{wbpm_m.mean():.3f}")
             elif len(pace_m): c4.metric("평균 페이스",   fmt_pace(pace_m.mean()))
 
+        mc1, mc2 = st.columns([4, 1])
         pm, py = (month - 1, year) if month > 1 else (12, year - 1)
         prev_df = df_c[
             (df_c["date"].apply(lambda d: d.year)  == py) &
@@ -1060,108 +1070,74 @@ def tab_calendar(df: pd.DataFrame):
         pw = prev_df["w_per_bpm"].dropna() if not prev_df.empty else pd.Series(dtype=float)
         if len(cw) and len(pw):
             chg = (cw.mean() - pw.mean()) / pw.mean() * 100
-            st.metric("W/bpm 전월 대비", f"{cw.mean():.3f}", delta=f"{chg:+.1f}%")
-
-    # ── 날짜 상세 분석 ────────────────────────────────────────────────────────
-    sel_d = st.session_state.cal_sel
-    if sel_d and sel_d in date_recs:
-        st.markdown("---")
-        dcol, ccol = st.columns([5, 1])
-        dcol.subheader(f"📅 {sel_d} 상세 분석")
-        if ccol.button("✕ 닫기", key="cal_close"):
-            st.session_state.cal_sel = None
+            mc1.metric("W/bpm 전월 대비", f"{cw.mean():.3f}", delta=f"{chg:+.1f}%")
+        mlabel = f"{year}-{month:02d}"
+        if mc2.button("📊 월간 리포트", key="cal_mrep"):
+            st.session_state.nav_tab = "리포트"
+            st.session_state.report_preset_type  = "월간"
+            st.session_state.report_preset_label = mlabel
             st.rerun()
-
-        for rec in date_recs[sel_d]:
-            sport  = str(rec.get("sport", "")).lower()
-            is_run = "run" in sport
-            icon   = "🏃" if is_run else "🚴"
-            fname  = os.path.basename(str(rec.get("filename", "")))
-            with st.expander(f"{icon} {fname} — {rec.get('sport','')}", expanded=True):
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("거리",      f"{rec['distance_km']:.2f} km" if _v(rec.get("distance_km")) else "-")
-                c2.metric("시간",      fmt_duration(rec.get("duration_sec")))
-                c3.metric("평균 심박", f"{rec['avg_hr']:.0f} bpm"     if _v(rec.get("avg_hr"))       else "-")
-                if is_run:
-                    c4.metric("평균 페이스", fmt_pace(rec.get("avg_pace")))
-                else:
-                    c4.metric("평균 파워", f"{rec['avg_power']:.0f} W" if _v(rec.get("avg_power")) else "-")
-
-                z_vals = [rec.get(f"z{i}_pct") or 0 for i in range(1, 6)]
-                if any(v > 0 for v in z_vals):
-                    fig_z = go.Figure(go.Bar(
-                        x=ZONE_NAMES, y=z_vals, marker_color=ZONE_COLORS,
-                        text=[f"{v:.1f}%" for v in z_vals], textposition="outside",
-                    ))
-                    fig_z.update_layout(
-                        yaxis=dict(title="%", range=[0, max(z_vals) * 1.3 + 5]),
-                        height=200, margin=dict(t=20, b=10, l=10, r=10), showlegend=False,
-                    )
-                    st.plotly_chart(fig_z, use_container_width=True)
-
-                raw_df = load_raw(str(rec.get("filename", "")))
-                if not raw_df.empty and "secs" in raw_df.columns:
-                    raw_df = raw_df.copy()
-                    raw_df["min"] = (raw_df["secs"] // 60).astype(int)
-                    if is_run and {"hr", "pace"}.issubset(raw_df.columns):
-                        min_df = raw_df.groupby("min").agg(
-                            hr=("hr", "mean"), pace=("pace", "median")
-                        ).reset_index()
-                        fig_r = make_subplots(specs=[[{"secondary_y": True}]])
-                        fig_r.add_trace(go.Scatter(x=min_df["min"], y=min_df["hr"],   name="심박",   line=dict(color="#E24B4A", width=1.5)), secondary_y=False)
-                        fig_r.add_trace(go.Scatter(x=min_df["min"], y=min_df["pace"], name="페이스", line=dict(color="#4A90D9", width=1.5)), secondary_y=True)
-                        fig_r.update_yaxes(secondary_y=True, autorange="reversed")
-                        fig_r.update_layout(height=220, margin=dict(t=10,b=10,l=10,r=10),
-                                            legend=dict(orientation="h", y=1.15))
-                        st.plotly_chart(fig_r, use_container_width=True)
-                    elif not is_run and {"hr", "watts"}.issubset(raw_df.columns):
-                        min_df = raw_df.groupby("min").agg(
-                            hr=("hr", "mean"), watts=("watts", "mean")
-                        ).reset_index()
-                        fig_r = make_subplots(specs=[[{"secondary_y": True}]])
-                        fig_r.add_trace(go.Scatter(x=min_df["min"], y=min_df["hr"],    name="심박", line=dict(color="#E24B4A", width=1.5)), secondary_y=False)
-                        fig_r.add_trace(go.Scatter(x=min_df["min"], y=min_df["watts"], name="파워", line=dict(color="#4A90D9", width=1.5)), secondary_y=True)
-                        fig_r.update_layout(height=220, margin=dict(t=10,b=10,l=10,r=10),
-                                            legend=dict(orientation="h", y=1.15))
-                        st.plotly_chart(fig_r, use_container_width=True)
-
-                if is_run:
-                    laps = load_laps(str(rec.get("filename", "")))
-                    if laps:
-                        st.markdown("**km 랩**")
-                        st.dataframe(pd.DataFrame(laps), use_container_width=True, hide_index=True)
 
 
 # ── 탭 3: 훈련 기록 ────────────────────────────────────────────────────────────
-def tab_records(df: pd.DataFrame):
+def tab_records(df: pd.DataFrame, max_hr: int, ftp: int):
+    # ── 상세 뷰 모드 ──────────────────────────────────────────────────────────
+    detail_file = st.session_state.get("rec_detail_file")
+    if detail_file:
+        bc1, bc2 = st.columns([1, 6])
+        if bc1.button("← 목록으로", key="rec_back"):
+            st.session_state.rec_detail_file = None
+            st.rerun()
+        if not df.empty:
+            match = df[df["filename"] == detail_file]
+            if not match.empty:
+                show_training_detail(match.iloc[0], df, max_hr, ftp)
+                return
+        st.error("해당 기록을 찾을 수 없습니다.")
+        return
+
     st.header("훈련 기록")
 
     if df.empty:
         st.info("저장된 훈련 기록이 없습니다.")
         return
 
-    sports = ["전체"] + sorted(df["sport"].dropna().unique().tolist())
-    sport_filter = st.selectbox("종목 필터", sports)
-    filtered = df if sport_filter == "전체" else df[df["sport"] == sport_filter]
+    # 날짜 필터 (캘린더에서 이동 시 자동 설정)
+    filter_date = st.session_state.get("rec_filter_date")
+    if filter_date:
+        fc1, fc2 = st.columns([4, 1])
+        fc1.info(f"📅 {filter_date} 훈련 기록")
+        if fc2.button("전체 보기", key="rec_date_clear"):
+            st.session_state.rec_filter_date = None
+            st.rerun()
+
+    sports       = ["전체"] + sorted(df["sport"].dropna().unique().tolist())
+    sport_filter = st.selectbox("종목 필터", sports, key="rec_sport_sel")
+    filtered     = df if sport_filter == "전체" else df[df["sport"] == sport_filter]
+    if filter_date:
+        filtered = filtered[filtered["date"] == filter_date]
 
     if filtered.empty:
-        st.info("해당 종목의 기록이 없습니다.")
+        st.info("해당 기록이 없습니다.")
         return
 
-    hc = st.columns([1.2, 1.8, 1, 1.2, 1.2, 1, 0.6])
-    for col, label in zip(hc, ["날짜", "파일명", "종목", "거리(km)", "시간", "평균HR", ""]):
+    hc = st.columns([1.1, 1.6, 0.9, 1.1, 1.0, 0.8, 0.5, 0.5])
+    for col, label in zip(hc, ["날짜", "파일명", "종목", "거리(km)", "시간", "평균HR", "📋", "🗑️"]):
         col.markdown(f"**{label}**")
     st.markdown("---")
 
     for _, row in filtered.iterrows():
-        c1, c2, c3, c4, c5, c6, c7 = st.columns([1.2, 1.8, 1, 1.2, 1.2, 1, 0.6])
+        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.1, 1.6, 0.9, 1.1, 1.0, 0.8, 0.5, 0.5])
         c1.write(str(row["date"]))
         c2.write(os.path.basename(str(row.get("filename", ""))))
         c3.write(str(row.get("sport", "")))
-        c4.write(f"{row['distance_km']:.2f}" if row["distance_km"] else "-")
-        c5.write(fmt_duration(row["duration_sec"]))
-        c6.write(f"{row['avg_hr']:.0f}" if row["avg_hr"] else "-")
-        if c7.button("🗑️", key=f"del_{row['id']}"):
+        c4.write(f"{row['distance_km']:.2f}" if row.get("distance_km") else "-")
+        c5.write(fmt_duration(row.get("duration_sec")))
+        c6.write(f"{row['avg_hr']:.0f}" if row.get("avg_hr") else "-")
+        if c7.button("📋", key=f"rec_det_{row['id']}", help="상세 보기"):
+            st.session_state.rec_detail_file = str(row["filename"])
+            st.rerun()
+        if c8.button("🗑️", key=f"del_{row['id']}", help="삭제"):
             with get_conn() as conn:
                 conn.execute("DELETE FROM training_log WHERE id = ?", (int(row["id"]),))
                 conn.execute("DELETE FROM training_raw WHERE filename = ?", (str(row["filename"]),))
@@ -1934,6 +1910,412 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
     return bytes(pdf.output())
 
 
+# ── 단일 훈련 PDF 리포트 ──────────────────────────────────────────────────────
+def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) -> bytes:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+    from fpdf import FPDF
+
+    sport      = str(row.get("sport", "")).lower()
+    is_running = "run" in sport
+    fname      = str(row.get("filename", ""))
+    date_str   = str(row.get("date", ""))
+
+    kr_font = None
+    for fp in [r"C:\Windows\Fonts\malgunsl.ttf", r"C:\Windows\Fonts\malgun.ttf"]:
+        if os.path.exists(fp):
+            kr_font = fp
+            break
+
+    for fn in ["Malgun Gothic", "Apple SD Gothic Neo", "NanumGothic"]:
+        try:
+            fm.findfont(fn, fallback_to_default=False)
+            plt.rcParams["font.family"] = fn
+            break
+        except Exception:
+            pass
+
+    df_c = df.copy()
+    df_c["date"] = pd.to_datetime(df_c["date"])
+    sport_key = "run" if is_running else "cycl"
+    hist = df_c[df_c["sport"].str.contains(sport_key, case=False, na=False)].sort_values("date").tail(10)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=10)
+    if kr_font:
+        pdf.add_font("KR", "", kr_font)
+        pdf.add_font("KR", "B", kr_font)
+
+    def fnt(sz, bold=False):
+        return (kr_font or "Helvetica"), ("B" if bold else ""), sz
+
+    def _add_chart(fig, h=60):
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        import tempfile as _tf
+        tmp = _tf.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.write(buf.read()); tmp.close()
+        pdf.image(tmp.name, x=None, w=pdf.epw, h=h)
+        os.unlink(tmp.name)
+
+    # ── Page 1: 정보 + 존 분포 + 분당 차트 ──────────────────────────────────
+    pdf.add_page()
+    fam, sty, sz = fnt(14, True)
+    pdf.set_font(fam, sty, sz)
+    icon_txt = "러닝" if is_running else "사이클링"
+    pdf.cell(0, 8, f"[{icon_txt}] 훈련 리포트  {date_str}", ln=True, align="C")
+    pdf.ln(2)
+
+    fields = [
+        ("종목",      row.get("sport", "-")),
+        ("파일",      os.path.basename(fname)),
+        ("코스",      row.get("course_name") or "-"),
+        ("실내/실외", "실내" if row.get("indoor") else "실외"),
+        ("거리",      f"{row['distance_km']:.2f} km"       if row.get("distance_km")   else "-"),
+        ("이동 시간", fmt_duration(row.get("moving_time_sec") or row.get("duration_sec"))),
+        ("정지 시간", fmt_duration(row.get("stop_time_sec")) if row.get("stop_time_sec") else "-"),
+        ("평균 속도", f"{row['avg_speed_kph']:.1f} km/h"   if row.get("avg_speed_kph") else "-"),
+        ("칼로리",    f"{row['calories']:.0f} kcal"         if row.get("calories")      else "-"),
+        ("실내 온도", f"{row['indoor_temp']:.1f} °C"        if row.get("indoor_temp")   else "-"),
+        ("평균 심박", f"{row['avg_hr']:.0f} bpm"            if row.get("avg_hr")        else "-"),
+        ("최대 심박", f"{row['max_hr']:.0f} bpm"            if row.get("max_hr")        else "-"),
+        ("HR 드리프트", f"{row['drift']:+.1f}%"             if row.get("drift") else "-"),
+        ("드리프트 평가", row.get("drift_grade") or "-"),
+    ]
+    if is_running:
+        fields += [
+            ("평균 페이스",     fmt_pace(row.get("avg_pace"))),
+            ("최고 페이스",     fmt_pace(row.get("best_pace"))),
+            ("페이스 드리프트", f"{row['pace_drift_sec']:+.0f}초/km" if row.get("pace_drift_sec") else "-"),
+            ("평균 케이던스",   f"{row['avg_cadence']:.0f} spm"       if row.get("avg_cadence")   else "-"),
+        ]
+    else:
+        fields += [
+            ("평균 파워",  f"{row['avg_power']:.0f} W"  if row.get("avg_power")  else "-"),
+            ("최대 파워",  f"{row['max_power']:.0f} W"  if row.get("max_power")  else "-"),
+            ("W/bpm",     f"{row['w_per_bpm']:.3f}"     if row.get("w_per_bpm")  else "-"),
+            ("스파이크",   f"{row['spike_count']}개 보정" if row.get("spike_count") else "없음"),
+            ("평균 케이던스", f"{row['avg_cadence']:.0f} rpm" if row.get("avg_cadence") else "-"),
+        ]
+
+    col_w = pdf.epw / 2
+    for idx, (label, val) in enumerate(fields):
+        if idx % 2 == 0:
+            pdf.set_x(pdf.l_margin)
+        fam2, _, _ = fnt(8, True); pdf.set_font(fam2, "B", 8)
+        pdf.cell(32, 5, label + ":", border=0)
+        fam3, _, _ = fnt(8); pdf.set_font(fam3, "", 8)
+        pdf.cell(col_w - 32, 5, str(val), border=0, ln=(idx % 2 == 1))
+        if idx % 2 == 0:
+            pdf.set_x(pdf.l_margin + col_w)
+    if len(fields) % 2 == 1:
+        pdf.ln()
+    pdf.ln(3)
+
+    # 심박 존 분포 차트
+    z_vals = [row.get(f"z{j}_pct") or 0 for j in range(1, 6)]
+    if any(v > 0 for v in z_vals):
+        fig, ax = plt.subplots(figsize=(7, 2))
+        bars = ax.bar(["Z1","Z2","Z3","Z4","Z5"], z_vals,
+                      color=["#B5D4F4","#9FE1CB","#FAC775","#F0997B","#E24B4A"])
+        for bar, v in zip(bars, z_vals):
+            if v > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, v + 0.5, f"{v:.1f}%",
+                        ha="center", va="bottom", fontsize=7)
+        ax.set_title("심박 존 분포", fontsize=9); ax.set_ylabel("%")
+        ax.set_ylim(0, max(z_vals) * 1.3 + 5)
+        fig.tight_layout(); _add_chart(fig, 48)
+
+    # 케이던스 구간 분포
+    cad_vals = [row.get(k) or 0 for k in ["cad_lt70","cad_70_80","cad_80_90","cad_90_100","cad_100p"]]
+    if any(v > 0 for v in cad_vals):
+        fig, ax = plt.subplots(figsize=(7, 2))
+        ax.bar(["<70","70-79","80-89","90-99","100+"], cad_vals, color="#4A90D9")
+        for i2, v in enumerate(cad_vals):
+            if v > 0:
+                ax.text(i2, v + 0.5, f"{v:.1f}%", ha="center", va="bottom", fontsize=7)
+        ax.set_title("케이던스 구간 분포 (rpm)", fontsize=9); ax.set_ylabel("%")
+        fig.tight_layout(); _add_chart(fig, 48)
+
+    # 분당 심박 + 파워/페이스 차트
+    raw_df = load_raw(fname)
+    if not raw_df.empty and "secs" in raw_df.columns:
+        raw_df = raw_df.copy()
+        raw_df["min"] = (raw_df["secs"] // 60).astype(int)
+        if is_running and {"hr","pace"}.issubset(raw_df.columns):
+            mdf2 = raw_df.groupby("min").agg(hr=("hr","mean"), pace=("pace","median")).reset_index()
+            fig, ax1 = plt.subplots(figsize=(7, 2.8))
+            ax1.plot(mdf2["min"], mdf2["hr"],   color="#E24B4A", linewidth=1.5, label="심박(bpm)")
+            ax2 = ax1.twinx()
+            ax2.plot(mdf2["min"], mdf2["pace"], color="#4A90D9", linewidth=1.5, label="페이스(초/km)")
+            ax2.invert_yaxis()
+            ax1.set_xlabel("경과(분)"); ax1.set_ylabel("심박(bpm)"); ax2.set_ylabel("페이스(초/km)")
+            h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+            ax1.legend(h1+h2, l1+l2, loc="upper right", fontsize=7)
+            ax1.set_title("분당 심박 & 페이스", fontsize=9)
+            fig.tight_layout(); _add_chart(fig, 60)
+        elif not is_running and {"hr","watts"}.issubset(raw_df.columns):
+            mdf2 = raw_df.groupby("min").agg(hr=("hr","mean"), watts=("watts","mean")).reset_index()
+            fig, ax1 = plt.subplots(figsize=(7, 2.8))
+            ax1.plot(mdf2["min"], mdf2["hr"],    color="#E24B4A", linewidth=1.5, label="심박(bpm)")
+            ax2 = ax1.twinx()
+            ax2.plot(mdf2["min"], mdf2["watts"], color="#4A90D9", linewidth=1.5, label="파워(W)")
+            ax1.set_xlabel("경과(분)"); ax1.set_ylabel("심박(bpm)"); ax2.set_ylabel("파워(W)")
+            h1, l1 = ax1.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
+            ax1.legend(h1+h2, l1+l2, loc="upper right", fontsize=7)
+            ax1.set_title("분당 심박 & 파워", fontsize=9)
+            fig.tight_layout(); _add_chart(fig, 60)
+
+    # ── Page 2: 누적 추이 + 코칭 피드백 + 랩 ───────────────────────────────
+    pdf.add_page()
+
+    if not is_running and len(hist) >= 2:
+        wbpm_h = hist["w_per_bpm"].dropna()
+        if len(wbpm_h) >= 2:
+            fig, ax = plt.subplots(figsize=(7, 2.5))
+            ax.plot(range(len(wbpm_h)), wbpm_h.values, "o-", color="#4A90D9", linewidth=2)
+            cur = row.get("w_per_bpm")
+            if cur:
+                ax.axhline(cur, color="#E24B4A", linestyle="--", linewidth=1, label="이번")
+                ax.legend(fontsize=7)
+            ax.set_title("최근 W/bpm 효율 추이", fontsize=9)
+            ax.set_xlabel("세션(오래된→최근)"); ax.set_ylabel("W/bpm")
+            fig.tight_layout(); _add_chart(fig, 55)
+
+    drift_h = hist["drift"].dropna() if len(hist) >= 2 else pd.Series(dtype=float)
+    if len(drift_h) >= 2:
+        colors_d = ["#9FE1CB" if abs(v) <= 4 else "#FAC775" if abs(v) <= 8 else "#E24B4A" for v in drift_h.values]
+        fig, ax = plt.subplots(figsize=(7, 2.5))
+        ax.bar(range(len(drift_h)), drift_h.values, color=colors_d)
+        ax.axhline(0, color="#888", linewidth=0.8)
+        ax.set_title("최근 HR 드리프트 추이 (초록=정상 노랑=주의 빨강=피로)", fontsize=8)
+        ax.set_xlabel("세션(오래된→최근)"); ax.set_ylabel("드리프트(%)")
+        fig.tight_layout(); _add_chart(fig, 55)
+
+    fam4, _, _ = fnt(10, True); pdf.set_font(fam4, "B", 10)
+    pdf.cell(0, 7, "코칭 피드백", ln=True)
+    for level, msg in coaching_feedback(dict(row)):
+        icon_m = {"success": "[OK]", "warning": "[!]", "error": "[X]"}.get(level, "[i]")
+        fam5, _, _ = fnt(8); pdf.set_font(fam5, "", 8)
+        pdf.multi_cell(0, 5, f"{icon_m} {msg}")
+
+    laps = load_laps(fname)
+    if laps and is_running:
+        pdf.ln(3)
+        fam6, _, _ = fnt(10, True); pdf.set_font(fam6, "B", 10)
+        pdf.cell(0, 7, "km 랩 분석", ln=True)
+        headers = list(laps[0].keys())
+        cw2 = pdf.epw / len(headers)
+        fam7, _, _ = fnt(8, True); pdf.set_font(fam7, "B", 8)
+        for h in headers:
+            pdf.cell(cw2, 5, str(h), border=1, align="C")
+        pdf.ln()
+        fam8, _, _ = fnt(8); pdf.set_font(fam8, "", 8)
+        for lap in laps:
+            for h in headers:
+                pdf.cell(cw2, 5, str(lap.get(h, "")), border=1, align="C")
+            pdf.ln()
+
+    pdf.set_y(-15)
+    fam9, _, _ = fnt(7); pdf.set_font(fam9, "", 7)
+    pdf.cell(0, 4, f"Generated by 훈련 분석 앱  |  {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  max_hr={max_hr}  FTP={ftp}W", align="C")
+
+    return bytes(pdf.output())
+
+
+# ── 단일 훈련 상세 뷰 (공용) ──────────────────────────────────────────────────
+def show_training_detail(row, df: pd.DataFrame, max_hr: int, ftp: int):
+    sport      = str(row.get("sport", "")).lower()
+    is_running = "run" in sport
+    fname      = str(row.get("filename", ""))
+    raw_df     = load_raw(fname)
+
+    # DB 저장값 우선, 없으면 원시 데이터에서 재계산
+    pace_drift_sec = row.get("pace_drift_sec")
+    best_pace_v    = row.get("best_pace")
+    if is_running and not raw_df.empty and "pace" in raw_df.columns:
+        pv = raw_df["pace"].dropna()
+        if len(pv) > 20:
+            if best_pace_v is None:
+                best_pace_v = float(pv.quantile(0.05))
+            if pace_drift_sec is None:
+                mid = len(pv) // 2
+                p1, p2 = pv.iloc[:mid].mean(), pv.iloc[mid:].mean()
+                if not (pd.isna(p1) or pd.isna(p2)):
+                    pace_drift_sec = round(p2 - p1, 1)
+
+    icon = "🏃" if is_running else "🚴"
+
+    # ── PDF 버튼 ──────────────────────────────────────────────────────────────
+    pdf_key  = f"pdf_cache_{fname}"
+    hdr1, hdr2 = st.columns([7, 1])
+    hdr1.markdown(
+        f"**{row.get('date','')}** &nbsp;|&nbsp; {row.get('sport','')} &nbsp;|&nbsp; "
+        f"{'실내' if row.get('indoor') else '실외'}"
+        + (f" &nbsp;|&nbsp; {row['course_name']}" if row.get("course_name") else ""),
+        unsafe_allow_html=True,
+    )
+    with hdr2:
+        if st.button("📄 PDF 생성", key=f"pdfbtn_{fname}"):
+            with st.spinner("PDF 생성 중..."):
+                try:
+                    st.session_state[pdf_key] = generate_training_pdf(dict(row), df, max_hr, ftp)
+                except Exception as e:
+                    st.error(f"PDF 생성 실패: {e}")
+        if st.session_state.get(pdf_key):
+            st.download_button(
+                "📥 다운로드",
+                data=st.session_state[pdf_key],
+                file_name=f"training_{os.path.basename(fname)}.pdf",
+                mime="application/pdf",
+                key=f"pdfdl_{fname}",
+            )
+
+    # ── 메트릭 행 1: 거리 / 시간 / 속도 / 칼로리 ────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("거리",      f"{row['distance_km']:.2f} km"    if row.get("distance_km")   else "-")
+    c2.metric("이동 시간", fmt_duration(row.get("moving_time_sec") or row.get("duration_sec")))
+    c3.metric("정지 시간", fmt_duration(row.get("stop_time_sec")) if row.get("stop_time_sec") else "-")
+    c4.metric("평균 속도", f"{row['avg_speed_kph']:.1f} km/h" if row.get("avg_speed_kph") else "-")
+
+    # ── 메트릭 행 2: 심박 ────────────────────────────────────────────────────
+    c5, c6, c7, c8 = st.columns(4)
+    drift_val   = row.get("drift")
+    drift_str   = f"{drift_val:+.1f}%" if drift_val is not None and not pd.isna(drift_val) else "-"
+    drift_grade = row.get("drift_grade") or _drift_grade(drift_val) or "-"
+    c5.metric("평균 심박",  f"{row['avg_hr']:.0f} bpm"  if row.get("avg_hr")  else "-")
+    c6.metric("최대 심박",  f"{row['max_hr']:.0f} bpm"  if row.get("max_hr")  else "-")
+    c7.metric("HR 드리프트", drift_str, help=f"평가: {drift_grade}")
+    c8.metric("소모 칼로리", f"{row['calories']:.0f} kcal" if row.get("calories") else "-")
+
+    # ── 메트릭 행 3: 종목별 ──────────────────────────────────────────────────
+    c9, c10, c11, c12 = st.columns(4)
+    if is_running:
+        c9.metric("평균 페이스",     fmt_pace(row.get("avg_pace")))
+        c10.metric("최고 페이스",    fmt_pace(best_pace_v))
+        pd_str = f"{pace_drift_sec:+.0f}초/km" if pace_drift_sec is not None else "-"
+        c11.metric("페이스 드리프트", pd_str)
+        c12.metric("평균 케이던스",  f"{row['avg_cadence']:.0f} spm" if row.get("avg_cadence") else "-")
+    else:
+        c9.metric("평균 파워",   f"{row['avg_power']:.0f} W"  if row.get("avg_power")  else "-")
+        c10.metric("최대 파워",  f"{row['max_power']:.0f} W"  if row.get("max_power")  else "-")
+        c11.metric("W/bpm 효율", f"{row['w_per_bpm']:.3f}"    if row.get("w_per_bpm")  else "-")
+        c12.metric("평균 케이던스", f"{row['avg_cadence']:.0f} rpm" if row.get("avg_cadence") else "-")
+
+    st.markdown("---")
+
+    # ── 심박 존 분포 + 케이던스 분포 ─────────────────────────────────────────
+    col_z, col_cad = st.columns([3, 2])
+    with col_z:
+        z_vals = [row.get(f"z{i}_pct") or 0 for i in range(1, 6)]
+        if any(v > 0 for v in z_vals):
+            fig_zone = go.Figure(go.Bar(
+                x=ZONE_NAMES, y=z_vals, marker_color=ZONE_COLORS,
+                text=[f"{v:.1f}%" for v in z_vals], textposition="outside",
+            ))
+            fig_zone.update_layout(
+                title="심박 존 분포",
+                yaxis=dict(title="%", range=[0, max(z_vals) * 1.3 + 5]),
+                height=230, margin=dict(t=35, b=10, l=10, r=10), showlegend=False,
+            )
+            st.plotly_chart(fig_zone, use_container_width=True)
+
+    with col_cad:
+        cad_keys   = ["cad_lt70", "cad_70_80", "cad_80_90", "cad_90_100", "cad_100p"]
+        cad_labels = ["<70", "70-79", "80-89", "90-99", "100+"]
+        cad_vals   = [row.get(k) or 0 for k in cad_keys]
+        avg_cad    = row.get("avg_cadence")
+        if any(v > 0 for v in cad_vals) and avg_cad:
+            unit = "spm" if is_running else "rpm"
+            fig_cad = go.Figure(go.Bar(
+                x=cad_labels, y=cad_vals, marker_color="#7BC96F",
+                text=[f"{v:.1f}%" for v in cad_vals], textposition="outside",
+            ))
+            fig_cad.update_layout(
+                title=f"케이던스 분포 (평균 {avg_cad:.0f} {unit})",
+                yaxis=dict(title="%", range=[0, max(cad_vals) * 1.3 + 5]),
+                height=230, margin=dict(t=35, b=10, l=10, r=10), showlegend=False,
+            )
+            st.plotly_chart(fig_cad, use_container_width=True)
+
+    # ── 분당 추이 차트 ────────────────────────────────────────────────────────
+    if not raw_df.empty and "secs" in raw_df.columns:
+        rdf = raw_df.copy()
+        rdf["min"] = (rdf["secs"] // 60).astype(int)
+        if is_running and {"hr", "pace"}.issubset(rdf.columns):
+            mdf = rdf.groupby("min").agg(hr=("hr","mean"), pace=("pace","median")).reset_index()
+            fig_r = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["hr"],   name="심박(bpm)", line=dict(color="#E24B4A", width=2)), secondary_y=False)
+            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["pace"], name="페이스(초/km)", line=dict(color="#4A90D9", width=2)), secondary_y=True)
+            fig_r.update_layout(title="분당 심박 & 페이스", height=270, margin=dict(t=35,b=10,l=10,r=10), legend=dict(orientation="h",y=1.12))
+            fig_r.update_xaxes(title_text="경과 시간 (분)")
+            fig_r.update_yaxes(title_text="심박 (bpm)", secondary_y=False)
+            fig_r.update_yaxes(title_text="페이스 (초/km)", secondary_y=True, autorange="reversed")
+            st.plotly_chart(fig_r, use_container_width=True)
+        elif not is_running and {"hr", "watts"}.issubset(rdf.columns):
+            mdf = rdf.groupby("min").agg(hr=("hr","mean"), watts=("watts","mean")).reset_index()
+            fig_r = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["hr"],    name="심박(bpm)", line=dict(color="#E24B4A", width=2)), secondary_y=False)
+            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["watts"], name="파워(W)",   line=dict(color="#4A90D9", width=2)), secondary_y=True)
+            fig_r.update_layout(title="분당 심박 & 파워", height=270, margin=dict(t=35,b=10,l=10,r=10), legend=dict(orientation="h",y=1.12))
+            fig_r.update_xaxes(title_text="경과 시간 (분)")
+            fig_r.update_yaxes(title_text="심박 (bpm)", secondary_y=False)
+            fig_r.update_yaxes(title_text="파워 (W)", secondary_y=True)
+            st.plotly_chart(fig_r, use_container_width=True)
+
+    # km 랩 (러닝)
+    if is_running:
+        laps = load_laps(fname)
+        if laps:
+            st.subheader("📊 km 랩 분석")
+            st.dataframe(pd.DataFrame(laps), use_container_width=True, hide_index=True)
+
+    # ── 누적 비교 ─────────────────────────────────────────────────────────────
+    if not df.empty and len(df) >= 2:
+        df_c = df.copy()
+        df_c["date"] = pd.to_datetime(df_c["date"])
+        hist2 = df_c[df_c["sport"].str.contains(sport_key if not is_running else "run", case=False, na=False)].sort_values("date").tail(10)
+        if len(hist2) >= 2:
+            col_t1, col_t2 = st.columns(2)
+            if not is_running:
+                wbpm_h = hist2["w_per_bpm"].dropna()
+                if len(wbpm_h) >= 2:
+                    with col_t1:
+                        fig_t = px.line(x=list(range(len(wbpm_h))), y=wbpm_h.values, markers=True,
+                                        title="최근 W/bpm 추이", labels={"x":"세션","y":"W/bpm"})
+                        fig_t.update_layout(height=180, margin=dict(t=35,b=20,l=20,r=10))
+                        st.plotly_chart(fig_t, use_container_width=True)
+            else:
+                pace_h = hist2["avg_pace"].dropna()
+                if len(pace_h) >= 2:
+                    with col_t1:
+                        fig_t = px.line(x=list(range(len(pace_h))), y=pace_h.values, markers=True,
+                                        title="최근 평균 페이스 추이", labels={"x":"세션","y":"초/km"})
+                        fig_t.update_yaxes(autorange="reversed")
+                        fig_t.update_layout(height=180, margin=dict(t=35,b=20,l=20,r=10))
+                        st.plotly_chart(fig_t, use_container_width=True)
+            drift_h = hist2["drift"].dropna()
+            if len(drift_h) >= 2:
+                with col_t2:
+                    colors_d = ["#9FE1CB" if abs(v) <= 4 else "#FAC775" if abs(v) <= 8 else "#E24B4A" for v in drift_h.values]
+                    fig_d = go.Figure(go.Bar(x=list(range(len(drift_h))), y=drift_h.values, marker_color=colors_d))
+                    fig_d.update_layout(title="최근 드리프트 추이", height=180,
+                                        margin=dict(t=35,b=20,l=20,r=10), xaxis_title="세션", yaxis_title="%")
+                    st.plotly_chart(fig_d, use_container_width=True)
+
+    # ── 코칭 피드백 ───────────────────────────────────────────────────────────
+    row_extra = dict(row)
+    if pace_drift_sec is not None:
+        row_extra["pace_drift_sec"] = pace_drift_sec
+    st.markdown("**💬 코칭 피드백**")
+    for level, msg in coaching_feedback(row_extra):
+        getattr(st, level if level in ("success", "warning", "error") else "info")(msg)
+
+
 # ── 탭 6: 리포트 ───────────────────────────────────────────────────────────────
 def tab_report(df: pd.DataFrame, max_hr: int, ftp: int):
     st.header("훈련 리포트")
@@ -1946,13 +2328,28 @@ def tab_report(df: pd.DataFrame, max_hr: int, ftp: int):
 
     # ── 리포트 생성 ─────────────────────────────────────────────────────────
     st.subheader("📄 리포트 생성")
+
+    # 캘린더에서 이동 시 preset 값 소비
+    preset_t = st.session_state.pop("report_preset_type",  None)
+    preset_l = st.session_state.pop("report_preset_label", None)
+    type_opts = ["주간", "월간", "분기", "반기", "연간"]
+    if preset_t and preset_t in type_opts:
+        st.session_state["rpt_type_sel"] = preset_t
+
     r1, r2 = st.columns(2)
-    period_type  = r1.selectbox("리포트 종류", ["주간", "월간", "분기", "반기", "연간"])
-    labels       = _period_labels(df, period_type)
+    period_type = r1.selectbox("리포트 종류", type_opts, key="rpt_type_sel")
+
+    labels = _period_labels(df, period_type)
     if not labels:
         st.info("해당 종류의 기간이 없습니다.")
         return
-    period_label = r2.selectbox("기간 선택", labels)
+
+    if preset_l and preset_l in labels:
+        st.session_state["rpt_label_sel"] = preset_l
+    if "rpt_label_sel" not in st.session_state or st.session_state["rpt_label_sel"] not in labels:
+        st.session_state["rpt_label_sel"] = labels[0]
+
+    period_label = r2.selectbox("기간 선택", labels, key="rpt_label_sel")
     period_start, period_end = _period_range(period_type, period_label)
     st.caption(f"대상 기간: {period_start.strftime('%Y-%m-%d')} ~ {period_end.strftime('%Y-%m-%d')}")
 
@@ -2054,6 +2451,9 @@ def tab_settings(max_hr: int, ftp: int):
 
 
 # ── 메인 ───────────────────────────────────────────────────────────────────────
+_NAV = ["최근 훈련", "캘린더", "훈련 기록", "트렌드", "히트맵", "리포트", "설정"]
+
+
 def main():
     st.set_page_config(
         page_title="훈련 분석",
@@ -2066,22 +2466,34 @@ def main():
     max_hr, ftp = sidebar()
     df = load_all()
 
-    tabs = st.tabs(["오늘의 훈련", "캘린더", "훈련 기록", "트렌드", "히트맵", "리포트", "설정"])
+    # ── 커스텀 탭 내비게이션 (session_state 기반 → 프로그래밍으로 전환 가능) ──
+    if "nav_tab" not in st.session_state:
+        st.session_state.nav_tab = _NAV[0]
+    if "rec_detail_file"  not in st.session_state: st.session_state.rec_detail_file  = None
+    if "rec_filter_date"  not in st.session_state: st.session_state.rec_filter_date  = None
 
-    with tabs[0]:
-        tab_today(df, max_hr, ftp)
-    with tabs[1]:
-        tab_calendar(df)
-    with tabs[2]:
-        tab_records(df)
-    with tabs[3]:
-        tab_trends(df, ftp)
-    with tabs[4]:
-        tab_heatmap(df)
-    with tabs[5]:
-        tab_report(df, max_hr, ftp)
-    with tabs[6]:
-        tab_settings(max_hr, ftp)
+    nav_cols = st.columns(len(_NAV))
+    for i, name in enumerate(_NAV):
+        active = st.session_state.nav_tab == name
+        btn_type = "primary" if active else "secondary"
+        if nav_cols[i].button(name, use_container_width=True, type=btn_type, key=f"nav_{name}"):
+            st.session_state.nav_tab = name
+            # 탭 전환 시 기록 상세 뷰·날짜 필터 초기화
+            if name != "훈련 기록":
+                st.session_state.rec_detail_file = None
+                st.session_state.rec_filter_date = None
+            st.rerun()
+
+    st.markdown("---")
+
+    tab = st.session_state.nav_tab
+    if   tab == "최근 훈련": tab_recent(df, max_hr, ftp)
+    elif tab == "캘린더":    tab_calendar(df)
+    elif tab == "훈련 기록": tab_records(df, max_hr, ftp)
+    elif tab == "트렌드":    tab_trends(df, ftp)
+    elif tab == "히트맵":    tab_heatmap(df)
+    elif tab == "리포트":    tab_report(df, max_hr, ftp)
+    elif tab == "설정":      tab_settings(max_hr, ftp)
 
 
 if __name__ == "__main__":
