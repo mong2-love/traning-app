@@ -2278,7 +2278,8 @@ def show_training_detail(row, df: pd.DataFrame, max_hr: int, ftp: int):
     if not df.empty and len(df) >= 2:
         df_c = df.copy()
         df_c["date"] = pd.to_datetime(df_c["date"])
-        hist2 = df_c[df_c["sport"].str.contains(sport_key if not is_running else "run", case=False, na=False)].sort_values("date").tail(10)
+        _sport_key = "run" if is_running else "cycl"
+        hist2 = df_c[df_c["sport"].str.contains(_sport_key, case=False, na=False)].sort_values("date").tail(10)
         if len(hist2) >= 2:
             col_t1, col_t2 = st.columns(2)
             if not is_running:
