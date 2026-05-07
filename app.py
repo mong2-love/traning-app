@@ -75,6 +75,7 @@ def init_db():
         # 기존 DB 마이그레이션
         for col, tbl, typ in [
             ("laps_json",       "training_raw", "TEXT"),
+            ("file_blob",       "training_raw", "BLOB"),
             ("course_name",     "training_log", "TEXT"),
             ("moving_time_sec", "training_log", "INTEGER"),
             ("stop_time_sec",   "training_log", "INTEGER"),
@@ -115,33 +116,97 @@ def assign_zone(bpm, zones):
     return 5
 
 
-def _extract_kst_date(path: str) -> str | None:
-    """FIT/GPX 파일에서 첫 번째 타임스탬프를 읽어 KST 날짜 문자열(YYYY-MM-DD)을 반환."""
-    if not path or not os.path.exists(path):
-        return None
-    ext = os.path.splitext(path)[1].lower()
+def _date_from_fit_bytes(data: bytes) -> str | None:
+    """FIT 바이트에서 첫 타임스탬프 → KST 날짜."""
     try:
-        if ext == ".fit":
-            from fitparse import FitFile
-            fit = FitFile(path)
-            for msg in fit.get_messages("record"):
-                for field in msg.fields:
-                    if field.name == "timestamp" and field.value is not None:
-                        ts = pd.Timestamp(field.value).tz_localize("UTC")
-                        return ts.tz_convert("Asia/Seoul").strftime("%Y-%m-%d")
-        elif ext == ".gpx":
-            import gpxpy
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                gpx = gpxpy.parse(f)
-            for track in gpx.tracks:
-                for seg in track.segments:
-                    for pt in seg.points:
-                        if pt.time:
-                            ts = pd.Timestamp(pt.time).tz_convert("Asia/Seoul")
-                            return ts.strftime("%Y-%m-%d")
+        from fitparse import FitFile
+        import io
+        fit = FitFile(io.BytesIO(data))
+        for msg in fit.get_messages("record"):
+            for field in msg.fields:
+                if field.name == "timestamp" and field.value is not None:
+                    ts = pd.Timestamp(field.value).tz_localize("UTC")
+                    return ts.tz_convert("Asia/Seoul").strftime("%Y-%m-%d")
     except Exception:
         pass
     return None
+
+
+def _date_from_gpx_bytes(data: bytes) -> str | None:
+    """GPX 바이트에서 첫 타임스탬프 → KST 날짜."""
+    try:
+        import gpxpy, io
+        gpx = gpxpy.parse(io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="ignore"))
+        for track in gpx.tracks:
+            for seg in track.segments:
+                for pt in seg.points:
+                    if pt.time:
+                        return pd.Timestamp(pt.time).tz_convert("Asia/Seoul").strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return None
+
+
+def _date_from_filename(name: str) -> str | None:
+    """파일명에서 날짜 추출 — YYYY-MM-DD / YYYY_MM_DD / YYYY-MMDD / YYYYMMDD 패턴."""
+    import re
+    base = os.path.basename(name)
+    # YYYY-MM-DD 또는 YYYY_MM_DD
+    m = re.search(r'(20\d{2})[-_](\d{2})[-_](\d{2})', base)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    # YYYY-MMDD (예: 2026-0507)
+    m = re.search(r'(20\d{2})[-_](\d{2})(\d{2})(?!\d)', base)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    # YYYYMMDD 연속 (예: 20260507)
+    m = re.search(r'(20\d{2})(\d{2})(\d{2})(?!\d)', base)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    return None
+
+
+def _extract_kst_date(path: str) -> str | None:
+    """다중 전략으로 KST 날짜 추출:
+    1) 파일 시스템에서 직접 파싱
+    2) DB에 저장된 file_blob 파싱
+    3) 파일명에서 날짜 추출
+    """
+    ext = os.path.splitext(path or "")[1].lower()
+
+    # 전략 1: 파일이 존재하면 직접 파싱
+    if path and os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            result = _date_from_fit_bytes(data) if ext == ".fit" else _date_from_gpx_bytes(data)
+            if result:
+                return result
+        except Exception:
+            pass
+
+    # 전략 2: DB file_blob 파싱
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT file_blob FROM training_raw WHERE filename = ?", (path,)
+            ).fetchone()
+        if row and row[0]:
+            data   = bytes(row[0])
+            result = _date_from_fit_bytes(data) if ext == ".fit" else _date_from_gpx_bytes(data)
+            if result:
+                return result
+    except Exception:
+        pass
+
+    # 전략 3: 파일명에서 날짜 추출
+    return _date_from_filename(path or "")
 
 
 def _drift_grade(drift):
@@ -570,12 +635,12 @@ def parse_gpx(path: str, max_hr: int, ftp: int):
 
 
 # ── 원시 데이터 저장/로드 ──────────────────────────────────────────────────────
-def save_raw(filename: str, df: pd.DataFrame):
+def save_raw(filename: str, df: pd.DataFrame, file_bytes: bytes | None = None):
     raw_json = df.to_json(orient="records")
     with get_conn() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO training_raw (filename, raw_json) VALUES (?, ?)",
-            (filename, raw_json),
+            "INSERT OR REPLACE INTO training_raw (filename, raw_json, file_blob) VALUES (?, ?, ?)",
+            (filename, raw_json, file_bytes),
         )
 
 
@@ -792,12 +857,19 @@ def sidebar():
     )
     if uploaded:
         for uf in uploaded:
+            raw_bytes = uf.read()
             tmp = os.path.join(tempfile.gettempdir(), uf.name)
             with open(tmp, "wb") as f:
-                f.write(uf.read())
+                f.write(raw_bytes)
             data = parse_file(tmp, max_hr, ftp)
             if data:
                 save_record(data)
+                # 원본 파일 바이트를 DB에 보관 (날짜 재파싱 시 활용)
+                with get_conn() as _c:
+                    _c.execute(
+                        "UPDATE training_raw SET file_blob = ? WHERE filename = ?",
+                        (raw_bytes, tmp),
+                    )
                 st.sidebar.success(f"✅ {uf.name} 저장됨")
             else:
                 st.sidebar.warning(f"⚠️ {uf.name} 파싱 실패")
