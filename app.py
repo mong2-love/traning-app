@@ -956,14 +956,32 @@ def tab_calendar(df: pd.DataFrame):
     # ── 데이터 준비 ───────────────────────────────────────────────────────────
     df_c = df.copy()
     df_c["date"] = pd.to_datetime(df_c["date"]).dt.date
+
+    # 캘린더 그리드 전체 범위 계산 (이전/다음 달 날짜 포함)
+    from datetime import timedelta as _td
+    first_of_month = date(year, month, 1)
+    last_of_month  = date(year, month, calendar.monthrange(year, month)[1])
+    cal_start = first_of_month - _td(days=first_of_month.weekday())       # 그리드 첫 번째 셀(월요일)
+    cal_end   = last_of_month  + _td(days=(6 - last_of_month.weekday()))  # 그리드 마지막 셀(일요일)
+
+    # 그리드 전체 범위로 데이터 조회
+    mdf_all = df_c[(df_c["date"] >= cal_start) & (df_c["date"] <= cal_end)]
+    # 이번 달만 (사이드 패널 통계용)
     mdf = df_c[
-        (df_c["date"].apply(lambda d: d.year)  == year) &
-        (df_c["date"].apply(lambda d: d.month) == month)
+        (df_c["date"].apply(lambda d: d.month) == month) &
+        (df_c["date"].apply(lambda d: d.year)  == year)
     ]
 
     date_recs: dict = {}
-    for _, row in mdf.iterrows():
+    for _, row in mdf_all.iterrows():
         date_recs.setdefault(row["date"], []).append(row.to_dict())
+
+    # 주(週) 리스트 생성 — 실제 date 객체 7개 × N주
+    _cal_weeks: list[list[date]] = []
+    _cur = cal_start
+    while _cur <= cal_end:
+        _cal_weeks.append([_cur + _td(days=i) for i in range(7)])
+        _cur += _td(days=7)
 
     def zone_bg(recs):
         if not recs: return ""
@@ -996,23 +1014,23 @@ def tab_calendar(df: pd.DataFrame):
                 unsafe_allow_html=True,
             )
 
-        for wi, week in enumerate(cal):
+        for wi, week in enumerate(_cal_weeks):
             cols      = st.columns(widths)
             week_recs = []
 
-            for i, day in enumerate(week):
-                if day == 0:
-                    cols[i].markdown("<div style='min-height:90px'></div>", unsafe_allow_html=True)
-                    continue
-
-                d    = date(year, month, day)
-                recs = date_recs.get(d, [])
+            for i, d in enumerate(week):
+                in_month = (d.month == month)
+                recs     = date_recs.get(d, [])
 
                 if recs:
                     week_recs.extend(recs)
                     bg     = zone_bg(recs)
-                    border = "2px solid #4A90D9" if d == today else "1px solid #ccc"
-                    lines  = [f"<b>{day}</b>"]
+                    # 이전/다음 달 셀은 배경을 연하게
+                    if not in_month:
+                        bg = bg.replace("0.35)", "0.15)").replace("0.25)", "0.10)")
+                    border    = "2px solid #4A90D9" if d == today else "1px solid #ccc"
+                    day_style = "" if in_month else "opacity:0.45;"
+                    lines     = [f"<b style='{day_style}'>{d.day}</b>"]
                     for r in recs:
                         sport  = str(r.get("sport", "")).lower()
                         is_run = "run" in sport
@@ -1038,12 +1056,14 @@ def tab_calendar(df: pd.DataFrame):
                         st.session_state.rec_detail_file = None
                         st.rerun()
                 else:
-                    style = (
-                        "font-weight:700;color:#4A90D9;border:2px solid #4A90D9;"
-                        if d == today else "color:#bbb;"
-                    )
+                    if d == today:
+                        style = "font-weight:700;color:#4A90D9;border:2px solid #4A90D9;"
+                    elif not in_month:
+                        style = "color:#ccc;"
+                    else:
+                        style = "color:#bbb;"
                     cols[i].markdown(
-                        f"<div style='text-align:center;padding:5px;min-height:90px;{style}'>{day}</div>",
+                        f"<div style='text-align:center;padding:5px;min-height:90px;{style}'>{d.day}</div>",
                         unsafe_allow_html=True,
                     )
 
@@ -1062,16 +1082,14 @@ def tab_calendar(df: pd.DataFrame):
                     + "<br>".join(parts) + "</div>",
                     unsafe_allow_html=True,
                 )
-                # 주간 리포트 이동 버튼
-                first_day = next((date(year, month, d) for d in week if d != 0), None)
-                if first_day:
-                    iso_y, iso_w, _ = first_day.isocalendar()
-                    wlabel = f"{iso_y}-W{iso_w:02d}"
-                    if cols[7].button("📊", key=f"cal_wrep_{wi}", help=f"{wlabel} 주간 리포트"):
-                        st.session_state.nav_tab = "리포트"
-                        st.session_state.report_preset_type  = "주간"
-                        st.session_state.report_preset_label = wlabel
-                        st.rerun()
+                # 주간 리포트 이동 버튼 — 해당 주 첫 번째 날 기준 ISO 주차
+                iso_y, iso_w, _ = week[0].isocalendar()
+                wlabel = f"{iso_y}-W{iso_w:02d}"
+                if cols[7].button("📊", key=f"cal_wrep_{wi}", help=f"{wlabel} 주간 리포트"):
+                    st.session_state.nav_tab = "리포트"
+                    st.session_state.report_preset_type  = "주간"
+                    st.session_state.report_preset_label = wlabel
+                    st.rerun()
 
     # ── 사이드 패널 ───────────────────────────────────────────────────────────
     with side_col:
@@ -1098,12 +1116,17 @@ def tab_calendar(df: pd.DataFrame):
 
         st.markdown("---")
         st.subheader("📊 주간 볼륨")
-        if not mdf.empty:
+        if not mdf_all.empty:
             wvol = []
-            for wi, week in enumerate(calendar.monthcalendar(year, month)):
-                ds    = {d for d in week if d != 0}
-                wdist = sum((r["distance_km"] or 0) for _, r in mdf.iterrows() if r["date"].day in ds)
-                wvol.append({"주": f"W{wi+1}", "km": round(wdist, 1)})
+            for wi, week in enumerate(_cal_weeks):
+                week_set = set(week)
+                wdist = sum(
+                    (r["distance_km"] or 0)
+                    for _, r in mdf_all.iterrows()
+                    if r["date"] in week_set
+                )
+                iso_y2, iso_w2, _ = week[0].isocalendar()
+                wvol.append({"주": f"W{iso_w2}", "km": round(wdist, 1)})
             fig_v = px.bar(pd.DataFrame(wvol), x="주", y="km",
                            color_discrete_sequence=["#4A90D9"])
             fig_v.update_layout(height=160, margin=dict(t=5, b=20, l=20, r=5),
