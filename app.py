@@ -909,6 +909,7 @@ def coaching_feedback(row: dict) -> list:
     msgs       = []
     sport      = str(row.get("sport", "")).lower()
     is_running = "running" in sport or "run" in sport
+    is_indoor  = bool(row.get("indoor"))
     drift      = row.get("drift")
     z1  = row.get("z1_pct") or 0
     z2  = row.get("z2_pct") or 0
@@ -951,13 +952,23 @@ def coaching_feedback(row: dict) -> list:
         if z4 + z5 > 30:
             msgs.append(("warning", f"고강도 구간 {z4+z5:.0f}% — 충분한 회복 후 다음 훈련에 임하세요."))
     else:
-        # 사이클링 Z2
-        if z2 >= 80:
-            msgs.append(("success", f"Z2 비율 {z2:.0f}% — Z2 목표를 달성했습니다. 유산소 기반 훈련 효과가 우수합니다."))
-        elif z2 >= 60:
-            msgs.append(("info",    f"Z2 비율 {z2:.0f}% — 부분 성공입니다. 다음 세션은 출력을 5W 낮춰 Z2 구간에 집중하세요."))
+        # ── 사이클링 Z2 — 실내/실외 구분 ────────────────────────────────────
+        if is_indoor:
+            # 실내: Z2 엄격하게 적용
+            if z2 >= 80:
+                msgs.append(("success", f"Z2 비율 {z2:.0f}% — Z2 목표를 달성했습니다. 유산소 기반 훈련 효과가 우수합니다."))
+            elif z2 >= 60:
+                msgs.append(("info",    f"Z2 비율 {z2:.0f}% — 부분 성공입니다. 다음 세션은 출력을 5W 낮춰 Z2 구간에 집중하세요."))
+            else:
+                msgs.append(("warning", f"Z2 비율 {z2:.0f}% — 강도가 높았습니다. 출력을 5~8W 낮추고 Z2 유지에 집중하세요."))
         else:
-            msgs.append(("warning", f"Z2 비율 {z2:.0f}% — 강도가 높았습니다. 출력을 5~8W 낮추고 Z2 유지에 집중하세요."))
+            # 실외: Z2 낮아도 야외 특성으로 안내, 높을 때만 긍정 피드백
+            if z2 >= 80:
+                msgs.append(("success", f"Z2 비율 {z2:.0f}% — 야외 라이딩에서 Z2 구간을 잘 유지했습니다. 훌륭합니다."))
+            elif z2 >= 60:
+                msgs.append(("info",    f"Z2 비율 {z2:.0f}% — 야외 라이딩 특성상 정상 범위입니다. 업힐·스프린트 구간이 심박을 올린 것으로 보입니다."))
+            else:
+                msgs.append(("info",    f"Z2 비율 {z2:.0f}% — 야외 라이딩 특성상 정상입니다. 코스 지형에 따른 심박 변동이 많을 수 있습니다."))
         if z4 + z5 > 40:
             msgs.append(("warning", f"고강도 구간 {z4+z5:.0f}% — 인터벌 효과가 높았습니다. 다음 세션 전 충분히 회복하세요."))
         elif z3 > 30:
