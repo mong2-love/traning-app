@@ -233,11 +233,27 @@ def _cad_zones(cad_series: pd.Series) -> dict:
 
 
 def fmt_duration(seconds):
-    if pd.isna(seconds) or seconds is None:
+    if seconds is None: return "-"
+    try:
+        if math.isnan(float(seconds)): return "-"
+    except (TypeError, ValueError):
         return "-"
     h, r = divmod(int(seconds), 3600)
     m, s = divmod(r, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _nv(val):
+    """None / NaN / Inf → None, 그 외 값 그대로 반환."""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return val
 
 
 def fmt_pace(sec_per_km):
@@ -319,7 +335,18 @@ def parse_fit(path: str, max_hr: int, ftp: int):
             secs        = (ts - valid_ts.iloc[0]).dt.total_seconds()
             df["secs"]  = secs
             secs_diff   = secs.diff().fillna(1.0)
-            moving_time = float(secs_diff[secs_diff < 30].sum())
+            # 이동 구간 감지: 속도/파워 기반 (야외 GPS 파일은 정지 중에도 1Hz 레코드가 찍힘)
+            if "kph" in df.columns:
+                kph_s     = pd.to_numeric(df["kph"], errors="coerce").fillna(0)
+                is_moving = (kph_s > 0.5) & (secs_diff < 30)
+            elif "watts" in df.columns:
+                watts_s   = pd.to_numeric(df["watts"], errors="coerce").fillna(0)
+                is_moving = (watts_s > 0) & (secs_diff < 30)
+            else:
+                is_moving = secs_diff < 30
+            moving_time = float(secs_diff[is_moving].sum())
+            if moving_time <= 0:
+                moving_time = float(secs_diff[secs_diff < 30].sum())
 
     # 파워 스파이크 보정 — 전후 5초 중앙값의 3배 & 400W 초과 → 중앙값으로 대체
     spike_count = 0
@@ -2156,48 +2183,65 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
     pdf.cell(pdf.epw, 8, f"[{icon_txt}] 훈련 리포트  {date_str}", ln=1, align="C")
     pdf.ln(2)
 
+    # NaN-safe 값 추출 헬퍼 (PDF 내부용)
+    def _g(key):
+        return _nv(row.get(key))
+
     _wbpm_change_str = "-"
-    if not is_running and row.get("w_per_bpm") and _prev_wbpm:
-        diff = row["w_per_bpm"] - _prev_wbpm
+    if not is_running and _g("w_per_bpm") is not None and _prev_wbpm is not None:
+        diff = _g("w_per_bpm") - _prev_wbpm
         _wbpm_change_str = f"{diff:+.3f} (전 {_prev_wbpm:.3f})"
+
+    _drift = _g("drift")
+    if _drift is not None and _hr1 is not None and _hr2 is not None:
+        _drift_str = f"{_drift:+.1f}%  ({_hr2 - _hr1:+.1f} bpm)"
+    elif _drift is not None:
+        _drift_str = f"{_drift:+.1f}%"
+    else:
+        _drift_str = "-"
+
+    _stop_t = _g("stop_time_sec")
+    _mov_t  = _g("moving_time_sec") or _g("duration_sec")
+
+    _sc = _g("spike_count")
+    _spike_str = f"{int(_sc)}개 보정" if (_sc is not None and int(_sc) > 0) else "없음"
 
     fields = [
         ("종목",          row.get("sport", "-")),
         ("파일",          os.path.basename(fname)),
         ("코스",          row.get("course_name") or "-"),
         ("실내/실외",     "실내" if row.get("indoor") else "실외"),
-        ("거리",          f"{row['distance_km']:.2f} km"       if row.get("distance_km")   else "-"),
-        ("이동 시간",     fmt_duration(row.get("moving_time_sec") or row.get("duration_sec"))),
-        ("정지 시간",     fmt_duration(row.get("stop_time_sec")) if row.get("stop_time_sec") else "-"),
-        ("평균 속도",     f"{row['avg_speed_kph']:.1f} km/h"   if row.get("avg_speed_kph") else "-"),
-        ("칼로리",        f"{row['calories']:.0f} kcal"         if row.get("calories")      else "-"),
-        ("실내 온도",     f"{row['indoor_temp']:.1f} °C"        if row.get("indoor_temp")   else "-"),
+        ("거리",          f"{_g('distance_km'):.2f} km"    if _g("distance_km")   is not None else "-"),
+        ("이동 시간",     fmt_duration(_mov_t)),
+        ("정지 시간",     fmt_duration(_stop_t)             if _stop_t is not None else "-"),
+        ("평균 속도",     f"{_g('avg_speed_kph'):.1f} km/h" if _g("avg_speed_kph") is not None else "-"),
+        ("칼로리",        f"{_g('calories'):.0f} kcal"      if _g("calories")      is not None else "-"),
+        ("실내 온도",     f"{_g('indoor_temp'):.1f} °C"     if _g("indoor_temp")   is not None else "-"),
         ("총 훈련 횟수",  f"{_total_count}회"),
-        ("평균 심박",     f"{row['avg_hr']:.0f} bpm"            if row.get("avg_hr")        else "-"),
-        ("최대 심박",     f"{row['max_hr']:.0f} bpm"            if row.get("max_hr")        else "-"),
+        ("평균 심박",     f"{_g('avg_hr'):.0f} bpm"         if _g("avg_hr")        is not None else "-"),
+        ("최대 심박",     f"{_g('max_hr'):.0f} bpm"         if _g("max_hr")        is not None else "-"),
         ("전반부 평균 심박", f"{_hr1:.0f} bpm" if _hr1 is not None else "-"),
         ("후반부 평균 심박", f"{_hr2:.0f} bpm" if _hr2 is not None else "-"),
-        ("심박 드리프트", f"{row['drift']:+.1f}%  ({_hr2 - _hr1:+.1f} bpm)" if (row.get("drift") and _hr1 is not None and _hr2 is not None) else
-                          (f"{row['drift']:+.1f}%" if row.get("drift") else "-")),
+        ("심박 드리프트", _drift_str),
         ("드리프트 평가", row.get("drift_grade") or "-"),
     ]
     if is_running:
         fields += [
-            ("평균 페이스",     fmt_pace(row.get("avg_pace"))),
-            ("최고 페이스",     fmt_pace(row.get("best_pace"))),
-            ("페이스 드리프트", f"{row['pace_drift_sec']:+.0f}초/km" if row.get("pace_drift_sec") else "-"),
-            ("평균 케이던스",   f"{row['avg_cadence']:.0f} spm"       if row.get("avg_cadence")   else "-"),
+            ("평균 페이스",     fmt_pace(_g("avg_pace"))),
+            ("최고 페이스",     fmt_pace(_g("best_pace"))),
+            ("페이스 드리프트", f"{_g('pace_drift_sec'):+.0f}초/km" if _g("pace_drift_sec") is not None else "-"),
+            ("평균 케이던스",   f"{_g('avg_cadence'):.0f} spm"       if _g("avg_cadence")   is not None else "-"),
         ]
     else:
         fields += [
             ("전반부 평균 파워", f"{_pwr1:.0f} W" if _pwr1 is not None else "-"),
             ("후반부 평균 파워", f"{_pwr2:.0f} W" if _pwr2 is not None else "-"),
-            ("평균 파워",        f"{row['avg_power']:.0f} W"  if row.get("avg_power")  else "-"),
-            ("최대 파워",        f"{row['max_power']:.0f} W"  if row.get("max_power")  else "-"),
-            ("W/bpm",            f"{row['w_per_bpm']:.3f}"     if row.get("w_per_bpm")  else "-"),
+            ("평균 파워",        f"{_g('avg_power'):.0f} W"  if _g("avg_power")  is not None else "-"),
+            ("최대 파워",        f"{_g('max_power'):.0f} W"  if _g("max_power")  is not None else "-"),
+            ("W/bpm",            f"{_g('w_per_bpm'):.3f}"    if _g("w_per_bpm")  is not None else "-"),
             ("W/bpm 변화",       _wbpm_change_str),
-            ("스파이크",         f"{row['spike_count']}개 보정" if row.get("spike_count") else "없음"),
-            ("평균 케이던스",    f"{row['avg_cadence']:.0f} rpm" if row.get("avg_cadence") else "-"),
+            ("스파이크",         _spike_str),
+            ("평균 케이던스",    f"{_g('avg_cadence'):.0f} rpm" if _g("avg_cadence") is not None else "-"),
         ]
 
     lw = 38  # 레이블 너비
@@ -2210,7 +2254,7 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
     pdf.ln(3)
 
     # 심박 존 분포 차트
-    z_vals = [row.get(f"z{j}_pct") or 0 for j in range(1, 6)]
+    z_vals = [(_nv(row.get(f"z{j}_pct")) or 0) for j in range(1, 6)]
     if any(v > 0 for v in z_vals):
         fig, ax = plt.subplots(figsize=(7, 2))
         bars = ax.bar(["Z1","Z2","Z3","Z4","Z5"], z_vals,
@@ -2224,7 +2268,7 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
         fig.tight_layout(); _add_chart(fig, 48)
 
     # 케이던스 구간 분포
-    cad_vals = [row.get(k) or 0 for k in ["cad_lt70","cad_70_80","cad_80_90","cad_90_100","cad_100p"]]
+    cad_vals = [(_nv(row.get(k)) or 0) for k in ["cad_lt70","cad_70_80","cad_80_90","cad_90_100","cad_100p"]]
     if any(v > 0 for v in cad_vals):
         fig, ax = plt.subplots(figsize=(7, 2))
         ax.bar(["<70","70-79","80-89","90-99","100+"], cad_vals, color="#4A90D9")
