@@ -1709,7 +1709,7 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
             except Exception:
                 pass
 
-    def fnt(sz): return (kr_font or "Helvetica"), "", sz
+    def fnt(sz): return ("KR" if kr_font else "Helvetica"), "", sz
 
     def _add_chart(fig, h=52):
         try:
@@ -1949,7 +1949,7 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
         pdf.add_font("KR", "B", kr_font)
 
     def fnt(sz, bold=False):
-        return (kr_font or "Helvetica"), ("B" if bold else ""), sz
+        return ("KR" if kr_font else "Helvetica"), ("B" if bold else ""), sz
 
     def _add_chart(fig, h=60):
         buf = BytesIO()
