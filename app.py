@@ -210,7 +210,7 @@ def parse_fit(path: str, max_hr: int, ftp: int):
         ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         valid_ts = ts.dropna()
         if len(valid_ts) > 0:
-            date_str    = valid_ts.iloc[0].strftime("%Y-%m-%d")
+            date_str    = valid_ts.iloc[0].to_pydatetime().astimezone().strftime("%Y-%m-%d")
             secs        = (ts - valid_ts.iloc[0]).dt.total_seconds()
             df["secs"]  = secs
             secs_diff   = secs.diff().fillna(1.0)
@@ -410,7 +410,7 @@ def parse_gpx(path: str, max_hr: int, ftp: int):
         ts       = pd.to_datetime(df["time"], utc=True, errors="coerce")
         valid_ts = ts.dropna()
         if len(valid_ts) > 0:
-            date_str   = valid_ts.iloc[0].strftime("%Y-%m-%d")
+            date_str   = valid_ts.iloc[0].to_pydatetime().astimezone().strftime("%Y-%m-%d")
             secs       = (ts - valid_ts.iloc[0]).dt.total_seconds()
             df["secs"] = secs
             secs_diff  = secs.diff().fillna(1.0)
@@ -2042,7 +2042,7 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
         ("최대 심박",     f"{row['max_hr']:.0f} bpm"            if row.get("max_hr")        else "-"),
         ("전반부 평균 심박", f"{_hr1:.0f} bpm" if _hr1 is not None else "-"),
         ("후반부 평균 심박", f"{_hr2:.0f} bpm" if _hr2 is not None else "-"),
-        ("심박 드리프트", f"{row['drift']:+.1f}% ({row['drift'] - 0:.1f} bpm 환산)" if row.get("drift") and _hr1 else
+        ("심박 드리프트", f"{row['drift']:+.1f}%  ({_hr2 - _hr1:+.1f} bpm)" if (row.get("drift") and _hr1 is not None and _hr2 is not None) else
                           (f"{row['drift']:+.1f}%" if row.get("drift") else "-")),
         ("드리프트 평가", row.get("drift_grade") or "-"),
     ]
@@ -2191,11 +2191,11 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
         rdf = raw_df.copy()
         rdf["min"] = (rdf["secs"] // 60).astype(int)
 
-        # detect moving minutes (speed > 0.5 km/h, or watts > 0 for cycling)
-        if "speed" in rdf.columns:
-            rdf["_moving"] = rdf["speed"] > 0.5
+        # detect moving minutes (kph > 0.5 km/h, or watts > 0 for indoor cycling)
+        if "kph" in rdf.columns:
+            rdf["_moving"] = pd.to_numeric(rdf["kph"], errors="coerce").fillna(0) > 0.5
         elif "watts" in rdf.columns:
-            rdf["_moving"] = rdf["watts"] > 0
+            rdf["_moving"] = pd.to_numeric(rdf["watts"], errors="coerce").fillna(0) > 0
         else:
             rdf["_moving"] = True
 
@@ -2204,7 +2204,7 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
         if "watts" in rdf.columns: agg_dict["watts"] = ("watts", "mean")
         if "pace"  in rdf.columns: agg_dict["pace"]  = ("pace",  "median")
         if "cad"   in rdf.columns: agg_dict["cad"]   = ("cad",   "mean")
-        if "speed" in rdf.columns: agg_dict["spd"]   = ("speed", "mean")
+        if "kph"   in rdf.columns: agg_dict["spd"]   = ("kph",   "mean")
         agg_dict["moving"] = ("_moving", "mean")
 
         mdf3 = rdf.groupby("min").agg(**agg_dict).reset_index()
