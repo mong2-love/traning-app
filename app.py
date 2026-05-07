@@ -1855,42 +1855,43 @@ def _period_labels(df: pd.DataFrame, period_type: str) -> list:
 
 def _coaching_summary(pf: pd.DataFrame) -> str:
     if pf.empty:
-        return "No training data for this period."
+        return "해당 기간에 훈련 데이터가 없습니다."
     lines = []
-    n = len(pf)
-    dist = pf["distance_km"].sum()
+    n      = len(pf)
+    dist   = pf["distance_km"].sum()
     time_h = pf["duration_sec"].sum() / 3600
-    lines.append(f"Total {n} sessions: {dist:.1f} km, {time_h:.1f} hours.")
+    lines.append(f"총 {n}세션: {dist:.1f} km, {time_h:.1f}시간.")
 
+    # W/bpm 추이: 첫 세션 vs 마지막 세션 비교
     wbpm = pf["w_per_bpm"].dropna()
     if len(wbpm) > 1:
-        mid = len(wbpm) // 2
-        a1, a2 = wbpm.iloc[:mid].mean(), wbpm.iloc[mid:].mean()
-        if a2 > a1 * 1.03:
-            lines.append(f"W/bpm efficiency trending up ({a1:.2f} to {a2:.2f}). Great fitness gains!")
-        elif a2 < a1 * 0.97:
-            lines.append(f"W/bpm efficiency declining ({a1:.2f} to {a2:.2f}). Consider extra recovery.")
+        first_w, last_w = float(wbpm.iloc[0]), float(wbpm.iloc[-1])
+        diff = last_w - first_w
+        if diff > 0.01:
+            lines.append(f"W/bpm 효율이 향상되고 있습니다 ({first_w:.3f} → {last_w:.3f}). 훈련 효과가 나타나고 있습니다.")
+        elif diff < -0.01:
+            lines.append(f"W/bpm 효율이 하락했습니다 ({first_w:.3f} → {last_w:.3f}). 회복 상태를 확인하세요.")
         else:
-            lines.append(f"W/bpm efficiency stable at {wbpm.mean():.2f}. Consistent training!")
+            lines.append(f"W/bpm 효율이 안정적으로 유지되고 있습니다 (평균 {wbpm.mean():.3f}).")
     elif len(wbpm) == 1:
-        lines.append(f"W/bpm efficiency: {wbpm.iloc[0]:.2f}.")
+        lines.append(f"W/bpm 효율: {wbpm.iloc[0]:.3f}.")
 
     drift = pf["drift"].dropna()
     if len(drift) > 0:
         avg_d = drift.mean()
         if abs(avg_d) <= 5:
-            lines.append("HR drift is low — excellent pacing control.")
+            lines.append("심박 드리프트가 낮습니다 — 페이스 조절이 안정적입니다.")
         elif abs(avg_d) <= 10:
-            lines.append(f"Average HR drift {avg_d:+.1f}%. Monitor hydration and even pacing.")
+            lines.append(f"평균 심박 드리프트 {avg_d:+.1f}%. 수분 섭취와 균등한 페이스 배분을 점검하세요.")
         else:
-            lines.append(f"High HR drift ({avg_d:+.1f}%). Reduce starting intensity or improve recovery.")
+            lines.append(f"심박 드리프트가 높습니다 ({avg_d:+.1f}%). 출발 강도를 낮추거나 회복을 보완하세요.")
 
     z2_avg  = pf["z2_pct"].mean()
     z45_avg = (pf["z4_pct"] + pf["z5_pct"]).mean()
     if not pd.isna(z2_avg)  and z2_avg  > 60:
-        lines.append(f"Z2 aerobic focus {z2_avg:.0f}% — excellent base-building approach.")
+        lines.append(f"Z2 유산소 비율 {z2_avg:.0f}% — 기초 체력 향상에 효과적인 훈련입니다.")
     if not pd.isna(z45_avg) and z45_avg > 30:
-        lines.append(f"High intensity {z45_avg:.0f}% — ensure adequate recovery between hard sessions.")
+        lines.append(f"고강도 구간 {z45_avg:.0f}% — 고강도 세션 사이에 충분한 회복을 확보하세요.")
     return " ".join(lines)
 
 
@@ -1960,16 +1961,15 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
     pf["date"]   = pd.to_datetime(pf["date"])
     pf["date_d"] = pf["date"].dt.date
 
-    type_en = {"주간": "Weekly", "월간": "Monthly", "분기": "Quarterly",
-               "반기": "Semi-Annual", "연간": "Annual"}
+    type_kr = {"주간": "주간", "월간": "월간", "분기": "분기", "반기": "반기", "연간": "연간"}
 
     # ── PAGE 1 : Title + Summary + W/bpm + Drift ─────────────────────────────
     pdf.add_page()
     pdf.set_font(*fnt(20)); pdf.set_text_color(30, 30, 30)
-    pdf.cell(0, 12, f"Training Report  —  {type_en.get(period_type, period_type)}", ln=True, align="C")
+    pdf.cell(0, 12, f"훈련 리포트  —  {type_kr.get(period_type, period_type)}", ln=True, align="C")
     pdf.set_font(*fnt(10)); pdf.set_text_color(110, 110, 110)
     pdf.cell(0, 6, f"{period_start.strftime('%Y-%m-%d')}  ~  {period_end.strftime('%Y-%m-%d')}", ln=True, align="C")
-    pdf.cell(0, 4, f"Generated: {date.today()}", ln=True, align="C")
+    pdf.cell(0, 4, f"생성일: {date.today()}", ln=True, align="C")
     pdf.ln(6)
 
     # Summary row
@@ -1979,11 +1979,11 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
     avg_hr = pf["avg_hr"].dropna().mean()
     avg_wb = pf["w_per_bpm"].dropna().mean()
     items  = [
-        ("Sessions",  str(n_sess)),
-        ("Distance",  f"{tot_d:.1f} km"),
-        ("Time",      fmt_duration(int(tot_t))),
-        ("Avg HR",    f"{avg_hr:.0f} bpm" if not pd.isna(avg_hr) else "-"),
-        ("Avg W/bpm", f"{avg_wb:.3f}"     if not pd.isna(avg_wb) else "-"),
+        ("세션 수",   str(n_sess)),
+        ("총 거리",   f"{tot_d:.1f} km"),
+        ("총 시간",   fmt_duration(int(tot_t))),
+        ("평균 심박", f"{avg_hr:.0f} bpm" if not pd.isna(avg_hr) else "-"),
+        ("평균 W/bpm", f"{avg_wb:.3f}"    if not pd.isna(avg_wb) else "-"),
     ]
     pdf.set_fill_color(245, 247, 250); pdf.set_draw_color(210, 215, 220)
     box_y = pdf.get_y(); cw = 36
@@ -1998,11 +1998,11 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
 
     # W/bpm chart
     pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
-    pdf.cell(0, 8, "W/bpm Efficiency Trend", ln=True)
+    pdf.cell(0, 8, "W/bpm 효율 추이", ln=True)
     wbpm_d = pf.dropna(subset=["w_per_bpm"])
     if not wbpm_d.empty:
         fig, ax = plt.subplots(figsize=(7, 2.2))
-        for indoor, color, label in [(1, '#4A90D9', 'Indoor'), (0, '#27AE60', 'Outdoor')]:
+        for indoor, color, label in [(1, '#4A90D9', '실내'), (0, '#27AE60', '실외')]:
             sub = wbpm_d[wbpm_d["indoor"] == indoor]
             if not sub.empty:
                 ax.plot(sub["date_d"], sub["w_per_bpm"], 'o-', color=color,
@@ -2012,11 +2012,11 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
         if wbpm_d["indoor"].nunique() > 1: ax.legend(fontsize=7)
         fig.tight_layout(pad=0.5); _add_chart(fig, h=52)
     else:
-        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "No W/bpm data.", ln=True)
+        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "W/bpm 데이터 없음.", ln=True)
 
     # Drift chart
     pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
-    pdf.cell(0, 8, "HR Drift Trend", ln=True)
+    pdf.cell(0, 8, "심박 드리프트 추이", ln=True)
     drift_d = pf.dropna(subset=["drift"])
     if not drift_d.empty:
         fig, ax = plt.subplots(figsize=(7, 2.2))
@@ -2024,36 +2024,36 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
                   for v in drift_d["drift"]]
         ax.bar(drift_d["date_d"], drift_d["drift"], color=colors, width=0.6)
         ax.axhline(0, color='#bbb', linewidth=0.8, linestyle='--')
-        ax.set_ylabel("Drift %", fontsize=8); ax.tick_params(labelsize=7)
+        ax.set_ylabel("드리프트 %", fontsize=8); ax.tick_params(labelsize=7)
         ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
-        handles = [mpatches.Patch(color='#27AE60', label='Stable ≤7%'),
-                   mpatches.Patch(color='#F39C12', label='Caution 7-10%'),
-                   mpatches.Patch(color='#E24B4A', label='High >10%')]
+        handles = [mpatches.Patch(color='#27AE60', label='안정 ≤7%'),
+                   mpatches.Patch(color='#F39C12', label='주의 7-10%'),
+                   mpatches.Patch(color='#E24B4A', label='피로 >10%')]
         ax.legend(handles=handles, fontsize=7)
         fig.tight_layout(pad=0.5); _add_chart(fig, h=52)
     else:
-        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "No drift data.", ln=True)
+        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "드리프트 데이터 없음.", ln=True)
 
     # ── PAGE 2 : Zone Distribution + Weekly Volume ────────────────────────────
     pdf.add_page()
 
     # Zone distribution (bar + pie)
     pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
-    pdf.cell(0, 8, "HR Zone Distribution  (cumulative average)", ln=True)
+    pdf.cell(0, 8, "심박 존 분포 (누적 평균)", ln=True)
     zone_cols  = ["z1_pct", "z2_pct", "z3_pct", "z4_pct", "z5_pct"]
     zone_avgs  = [0.0 if pd.isna(pf[c].mean()) else float(pf[c].mean()) for c in zone_cols]
-    zone_en    = ["Z1 Recovery", "Z2 Aerobic", "Z3 Tempo", "Z4 Threshold", "Z5 Max"]
+    zone_kr    = ["Z1 회복", "Z2 유산소", "Z3 템포", "Z4 역치", "Z5 최대"]
     z_colors   = ["#B5D4F4", "#9FE1CB", "#FAC775", "#F0997B", "#E24B4A"]
     if sum(zone_avgs) > 0:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7, 2.5))
         bars = ax1.bar(["Z1","Z2","Z3","Z4","Z5"], zone_avgs, color=z_colors)
-        ax1.set_ylabel("Avg %", fontsize=7); ax1.tick_params(labelsize=7)
+        ax1.set_ylabel("평균 %", fontsize=7); ax1.tick_params(labelsize=7)
         ax1.spines['top'].set_visible(False); ax1.spines['right'].set_visible(False)
         for bar, val in zip(bars, zone_avgs):
             if val > 0.5:
                 ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
                          f'{val:.0f}%', ha='center', va='bottom', fontsize=6)
-        nz = [(n, v, c) for n, v, c in zip(zone_en, zone_avgs, z_colors) if v > 0]
+        nz = [(n, v, c) for n, v, c in zip(zone_kr, zone_avgs, z_colors) if v > 0]
         if nz:
             ns, vs, cs = zip(*nz)
             ax2.pie(vs, labels=None, colors=cs, autopct='%1.0f%%',
@@ -2061,17 +2061,23 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
             ax2.legend(ns, loc='center left', bbox_to_anchor=(1, 0.5), fontsize=5.5)
         fig.tight_layout(pad=0.3); _add_chart(fig, h=60)
     else:
-        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "No zone data.", ln=True)
+        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "데이터 없음.", ln=True)
 
     # Weekly volume
     pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
-    pdf.cell(0, 8, "Weekly Training Volume", ln=True)
+    pdf.cell(0, 8, "주간 훈련 볼륨", ln=True)
     wv = pf.copy()
     wv["week_start"] = wv["date_d"].apply(lambda d: d - timedelta(days=d.weekday()))
+    _is_run = wv["sport"].str.contains("run", case=False, na=False)
+    _indoor = wv["indoor"].fillna(False).astype(bool)
+    wv["_cyc_in"]  = (~_is_run) & _indoor
+    wv["_cyc_out"] = (~_is_run) & (~_indoor)
+    wv["_run"]     = _is_run
     wgrp = wv.groupby("week_start").agg(
         dist=("distance_km", "sum"),
-        n_run=("sport", lambda x: sum(1 for s in x if "run" in str(s).lower())),
-        n_cyc=("sport", lambda x: sum(1 for s in x if "run" not in str(s).lower())),
+        n_cyc_in=("_cyc_in",  "sum"),
+        n_cyc_out=("_cyc_out", "sum"),
+        n_run=("_run", "sum"),
     ).reset_index()
     if not wgrp.empty:
         fig, ax = plt.subplots(figsize=(7, 2.2))
@@ -2079,34 +2085,35 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
         ax.bar(xlabels, wgrp["dist"], color='#4A90D9')
         for xi, (_, row) in enumerate(wgrp.iterrows()):
             parts = []
-            if row["n_cyc"] > 0: parts.append(f"C{int(row['n_cyc'])}")
-            if row["n_run"] > 0: parts.append(f"R{int(row['n_run'])}")
+            if row["n_cyc_in"]  > 0: parts.append(f"사이클링(실내)×{int(row['n_cyc_in'])}" if row["n_cyc_in"] > 1 else "사이클링(실내)")
+            if row["n_cyc_out"] > 0: parts.append(f"사이클링(실외)×{int(row['n_cyc_out'])}" if row["n_cyc_out"] > 1 else "사이클링(실외)")
+            if row["n_run"]     > 0: parts.append(f"러닝×{int(row['n_run'])}" if row["n_run"] > 1 else "러닝")
             if parts:
-                ax.text(xi, row["dist"] + 0.2, " ".join(parts),
-                        ha='center', va='bottom', fontsize=7)
+                ax.text(xi, row["dist"] + 0.2, "\n".join(parts),
+                        ha='center', va='bottom', fontsize=6)
         ax.set_ylabel("km", fontsize=8); ax.tick_params(labelsize=7)
         ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
         fig.tight_layout(pad=0.5); _add_chart(fig, h=52)
     else:
-        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "No data.", ln=True)
+        pdf.set_font(*fnt(9)); pdf.cell(0, 6, "데이터 없음.", ln=True)
 
     # ── PAGE 3 : Best Records + Coaching Summary ──────────────────────────────
     pdf.add_page()
     pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
-    pdf.cell(0, 8, "Best Records", ln=True)
+    pdf.cell(0, 8, "베스트 기록", ln=True)
 
     best_wb   = pf["w_per_bpm"].dropna()
     best_dist = pf["distance_km"].dropna()
     best_dr   = pf["drift"].dropna()
     best_pwr  = pf["avg_power"].dropna()
-    best_pace = pf["avg_pace"].dropna()
+    best_pace_run = pf[pf["sport"].str.contains("run", case=False, na=False)]["avg_pace"].dropna()
     bests = [
-        ("Best W/bpm",       f"{best_wb.max():.3f}"     if len(best_wb)   else "-"),
-        ("Longest Distance", f"{best_dist.max():.1f} km" if len(best_dist) else "-"),
-        ("Best HR Drift",    f"{best_dr.abs().min():.1f}%" if len(best_dr) else "-"),
-        ("Best Avg Power",   f"{best_pwr.max():.0f} W"  if len(best_pwr)  else "-"),
-        ("Best Avg Pace",    fmt_pace(best_pace.min())   if len(best_pace) else "-"),
-        ("Total Sessions",   str(n_sess)),
+        ("최고 W/bpm",    f"{best_wb.max():.3f}"        if len(best_wb)       else "-"),
+        ("최장 거리",     f"{best_dist.max():.1f} km"   if len(best_dist)     else "-"),
+        ("최저 심박 드리프트", f"{best_dr.abs().min():.1f}%" if len(best_dr)  else "-"),
+        ("최고 평균 파워", f"{best_pwr.max():.0f} W"    if len(best_pwr)      else "-"),
+        ("최고 페이스",   fmt_pace(best_pace_run.min())  if len(best_pace_run) else "-"),
+        ("총 세션",      str(n_sess)),
     ]
     pdf.set_fill_color(248, 249, 251); pdf.set_draw_color(215, 220, 225)
     box_y = pdf.get_y(); cw2 = 58; rh = 18
@@ -2122,7 +2129,7 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
 
     # Coaching summary
     pdf.set_font(*fnt(12)); pdf.set_text_color(40, 40, 40)
-    pdf.cell(0, 8, "Coaching Summary", ln=True)
+    pdf.cell(0, 8, "코칭 총평", ln=True)
     summary = _coaching_summary(pf)
     pdf.set_fill_color(252, 253, 255); pdf.set_draw_color(200, 210, 230)
     pdf.set_text_color(50, 50, 50); pdf.set_font(*fnt(10))
@@ -2131,7 +2138,7 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
 
     # Footer
     pdf.set_font(*fnt(8)); pdf.set_text_color(170, 170, 170)
-    pdf.cell(0, 5, f"Training Analysis App  |  Generated {date.today()}", align="C", ln=True)
+    pdf.cell(0, 5, f"훈련 분석 앱  |  생성일: {date.today()}", align="C", ln=True)
 
     return bytes(pdf.output())
 
@@ -2777,10 +2784,12 @@ def tab_report(df: pd.DataFrame, max_hr: int, ftp: int):
 
     if st.button("📄 PDF 생성 및 저장", type="primary"):
         df_p = df.copy()
-        df_p["date"] = pd.to_datetime(df_p["date"])
+        df_p["date"] = pd.to_datetime(df_p["date"]).dt.normalize()  # 시간 제거 → 날짜만 비교
+        _ps = pd.Timestamp(period_start)
+        _pe = pd.Timestamp(period_end) + pd.Timedelta(hours=23, minutes=59, seconds=59)
         period_df = df_p[
-            (df_p["date"].dt.date >= period_start) &
-            (df_p["date"].dt.date <= period_end)
+            (df_p["date"] >= _ps) &
+            (df_p["date"] <= _pe)
         ].copy()
         if period_df.empty:
             st.warning("해당 기간에 훈련 데이터가 없습니다.")
