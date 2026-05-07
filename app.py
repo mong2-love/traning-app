@@ -2388,19 +2388,47 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
 
         mdf3 = rdf.groupby("min").agg(**agg_dict).reset_index()
 
-        # build rows list
-        tbl_rows = []
+        # 분 범위 전체 채우기 — 레코드 없는 정지 구간도 포함
+        if not mdf3.empty:
+            min_m, max_m = int(mdf3["min"].min()), int(mdf3["min"].max())
+            mdf3 = mdf3.set_index("min").reindex(range(min_m, max_m + 1)).reset_index()
+            mdf3["moving"] = mdf3["moving"].fillna(0)   # 공백 구간 = 정지
+
+        # 분별 행 목록 구성 (이동/정지 모두 포함)
+        _raw_rows = []   # (min_val, is_moving, hr, p, cad, spd)
         for _, mr in mdf3.iterrows():
-            m_val   = int(mr["min"])
-            moving  = mr.get("moving", 1.0) > 0.3
-            hr_val  = f"{mr['hr']:.0f}" if "hr" in mr.index and not pd.isna(mr.get("hr", float('nan'))) and moving else "-"
-            if is_running:
-                p_val = fmt_pace(mr.get("pace")) if "pace" in mr.index and not pd.isna(mr.get("pace", float('nan'))) and moving else "-"
+            m_val  = int(mr["min"])
+            moving = float(mr.get("moving", 0)) > 0.3
+            if moving:
+                hr_val  = f"{mr['hr']:.0f}"      if ("hr"    in mr.index and _nv(mr.get("hr"))    is not None) else "-"
+                if is_running:
+                    p_val = fmt_pace(mr.get("pace")) if ("pace"  in mr.index and _nv(mr.get("pace")) is not None) else "-"
+                else:
+                    p_val = f"{mr['watts']:.0f}"  if ("watts" in mr.index and _nv(mr.get("watts")) is not None) else "-"
+                cad_val = f"{mr['cad']:.0f}"      if ("cad"   in mr.index and _nv(mr.get("cad"))   is not None) else "-"
+                spd_val = f"{mr['spd']:.1f}"      if ("spd"   in mr.index and _nv(mr.get("spd"))   is not None) else "-"
             else:
-                p_val = f"{mr['watts']:.0f}" if "watts" in mr.index and not pd.isna(mr.get("watts", float('nan'))) and moving else "-"
-            cad_val = f"{mr['cad']:.0f}" if "cad"  in mr.index and not pd.isna(mr.get("cad", float('nan'))) and moving else "-"
-            spd_val = f"{mr['spd']:.1f}" if "spd"  in mr.index and not pd.isna(mr.get("spd", float('nan'))) and moving else "-"
-            tbl_rows.append((str(m_val), hr_val, p_val, cad_val, spd_val))
+                hr_val = p_val = cad_val = spd_val = "-"
+            _raw_rows.append((m_val, moving, hr_val, p_val, cad_val, spd_val))
+
+        # 연속 정지 구간을 한 행으로 병합
+        tbl_rows = []   # (경과(분) 텍스트, hr, p, cad, spd)
+        i = 0
+        while i < len(_raw_rows):
+            m_val, moving, hr_val, p_val, cad_val, spd_val = _raw_rows[i]
+            if moving:
+                tbl_rows.append((str(m_val), hr_val, p_val, cad_val, spd_val))
+                i += 1
+            else:
+                # 연속 정지 구간 끝 탐색
+                j = i
+                while j < len(_raw_rows) and not _raw_rows[j][1]:
+                    j += 1
+                s_m = _raw_rows[i][0]
+                e_m = _raw_rows[j - 1][0]
+                lbl = f"{s_m}~{e_m}분 (정지)" if e_m > s_m else f"{s_m}분 (정지)"
+                tbl_rows.append((lbl, "-", "-", "-", "-"))
+                i = j
 
         p_hdr = "페이스(분:초/km)" if is_running else "파워(W)"
         hdrs  = ["경과(분)", "심박(bpm)", p_hdr, "케이던스(rpm)", "속도(km/h)"]
@@ -2429,38 +2457,82 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
 
         def _tbl_row(x_start, cells, shade):
             fam_r, _, _ = fnt(7); pdf.set_font(fam_r, "", 7)
-            if shade:
+            is_stop = str(cells[0]).endswith("(정지)")
+            if is_stop:
+                pdf.set_fill_color(240, 240, 245)   # 정지 구간 — 회색 배경
+                pdf.set_text_color(160, 160, 170)
+            elif shade:
                 pdf.set_fill_color(248, 249, 252)
+                pdf.set_text_color(50, 50, 50)
             else:
                 pdf.set_fill_color(255, 255, 255)
-            pdf.set_text_color(50, 50, 50)
+                pdf.set_text_color(50, 50, 50)
             cur_x = x_start
-            for cell, cw in zip(cells, cw_set):
+            for ci, (cell, cw) in enumerate(zip(cells, cw_set)):
                 pdf.set_xy(cur_x, pdf.get_y())
-                pdf.cell(cw, 4.5, str(cell), border=1, align="C", fill=True, ln=0)
+                # 정지 행의 첫 셀은 왼쪽 정렬로 읽기 쉽게
+                align = "L" if (is_stop and ci == 0) else "C"
+                pdf.cell(cw, 4.5, str(cell), border=1, align=align, fill=True, ln=0)
                 cur_x += cw
 
+        def _is_stop(row_tuple):
+            return str(row_tuple[0]).endswith("(정지)")
+
+        def _stop_full_row(x_start, label, total_w):
+            """정지 행을 total_w 너비의 병합 셀 하나로 렌더링."""
+            fam_s, _, _ = fnt(7); pdf.set_font(fam_s, "", 7)
+            pdf.set_fill_color(240, 240, 245)
+            pdf.set_text_color(160, 160, 170)
+            pdf.set_xy(x_start, pdf.get_y())
+            pdf.cell(total_w, 4.5, label, border=1, align="C", fill=True, ln=0)
+
         if use_two_col:
-            x1 = pdf.l_margin
-            x2 = x1 + sum(cw_set) + gap
-            # header row for both columns
-            start_y = pdf.get_y()
+            x1        = pdf.l_margin
+            x2        = x1 + sum(cw_set) + gap
+            both_w    = sum(cw_set) * 2 + gap   # 정지 행 전체 너비
+            start_y   = pdf.get_y()
             _tbl_header(x1); pdf.set_xy(x2, start_y); _tbl_header(x2)
             pdf.ln(5)
-            for i, r1 in enumerate(col1):
-                r2      = col2[i] if i < len(col2) else None
-                row_y   = pdf.get_y()
-                _tbl_row(x1, r1, i % 2 == 0)
-                if r2:
-                    pdf.set_xy(x2, row_y)
-                    _tbl_row(x2, r2, i % 2 == 0)
-                pdf.ln(4.5)
-        else:
-            x1 = pdf.l_margin
-            _tbl_header(x1); pdf.ln(5)
-            for i, r1 in enumerate(col1):
+
+            # 정지 행 인덱스 파악: col1/col2 나누기 전 원본 tbl_rows 기준으로 2열 flow 렌더링
+            i1 = i2 = 0   # col1, col2 포인터
+            shade_cnt = 0
+            while i1 < len(col1) or i2 < len(col2):
                 row_y = pdf.get_y()
-                _tbl_row(x1, r1, i % 2 == 0)
+                r1 = col1[i1] if i1 < len(col1) else None
+                r2 = col2[i2] if i2 < len(col2) else None
+
+                if r1 and _is_stop(r1):
+                    # 정지 행 → 전체 너비 병합 셀
+                    _stop_full_row(x1, r1[0], both_w)
+                    pdf.ln(4.5)
+                    i1 += 1
+                elif r2 and _is_stop(r2) and r1 is None:
+                    _stop_full_row(x1, r2[0], both_w)
+                    pdf.ln(4.5)
+                    i2 += 1
+                else:
+                    shade = shade_cnt % 2 == 0
+                    if r1:
+                        _tbl_row(x1, r1, shade)
+                        i1 += 1
+                    if r2:
+                        pdf.set_xy(x2, row_y)
+                        _tbl_row(x2, r2, shade)
+                        i2 += 1
+                    pdf.ln(4.5)
+                    shade_cnt += 1
+        else:
+            x1      = pdf.l_margin
+            col_w   = sum(cw_set)
+            _tbl_header(x1); pdf.ln(5)
+            shade_cnt = 0
+            for r1 in col1:
+                if _is_stop(r1):
+                    _stop_full_row(x1, r1[0], col_w)
+                else:
+                    _tbl_row(x1, r1, shade_cnt % 2 == 0)
+                    shade_cnt += 1
                 pdf.ln(4.5)
 
     pdf.set_y(-15)
