@@ -1015,19 +1015,46 @@ def tab_recent(df: pd.DataFrame, max_hr: int, ftp: int):
         st.info("훈련 데이터가 없습니다. 사이드바에서 파일을 업로드하세요.")
         return
 
-    df_s        = df.sort_values("date", ascending=False)
-    latest_date = str(df_s.iloc[0]["date"])
-    latest_df   = df_s[df_s["date"] == latest_date]
+    df_s  = df.sort_values("date", ascending=False).reset_index(drop=True)
+    total = len(df_s)
 
-    st.caption(f"가장 최근 훈련일: **{latest_date}**")
+    # 세션 인덱스 초기화 (0 = 가장 최근)
+    if "recent_idx" not in st.session_state:
+        st.session_state.recent_idx = 0
+    idx = int(max(0, min(st.session_state.recent_idx, total - 1)))
+    st.session_state.recent_idx = idx
+
+    row      = df_s.iloc[idx]
+    cur_date = str(row.get("date", ""))
+    sport    = str(row.get("sport", "")).lower()
+    icon     = "🏃" if "run" in sport else "🚴"
+
+    # ── 네비게이션 바 ─────────────────────────────────────────────────────────
+    nc1, nc2, nc3 = st.columns([1, 3, 1])
+    with nc1:
+        if idx < total - 1:
+            if st.button("◀ 이전 훈련", use_container_width=True):
+                st.session_state.recent_idx += 1
+                st.rerun()
+        else:
+            st.button("◀ 이전 훈련", disabled=True, use_container_width=True)
+    nc2.markdown(
+        f"<div style='text-align:center;padding:6px 0'>"
+        f"{icon} <b>{cur_date}</b>"
+        f"<span style='color:#999;font-size:0.85em'> &nbsp;({idx + 1} / {total}회)</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    with nc3:
+        if idx > 0:
+            if st.button("다음 훈련 ▶", use_container_width=True):
+                st.session_state.recent_idx -= 1
+                st.rerun()
+        else:
+            st.button("다음 훈련 ▶", disabled=True, use_container_width=True)
+
     st.markdown("---")
-
-    for _, row in latest_df.iterrows():
-        sport  = str(row.get("sport", "")).lower()
-        icon   = "🏃" if "run" in sport else "🚴"
-        fname  = os.path.basename(str(row.get("filename", "")))
-        with st.expander(f"{icon} {fname} — {row['sport']}", expanded=True):
-            show_training_detail(row, df, max_hr, ftp)
+    show_training_detail(row, df, max_hr, ftp)
 
 
 # ── 탭 2: 캘린더 ───────────────────────────────────────────────────────────────
@@ -2449,12 +2476,12 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
             half   = (len(tbl_rows) + 1) // 2
             col1   = tbl_rows[:half]
             col2   = tbl_rows[half:]
-            cw_set = [10, 14, 22, 18, 14]  # widths per sub-col (sum=78)
-            gap    = 4                       # gap between the two columns
+            cw_set = [26, 12, 18, 12, 10]  # widths per sub-col (sum=78, 첫셀↑)
+            gap    = 4
         else:
             col1   = tbl_rows
             col2   = []
-            cw_set = [14, 18, 30, 24, 20]  # single column widths (sum≈106)
+            cw_set = [44, 16, 22, 14, 10]  # single column widths (sum=106, 첫셀↑)
             gap    = 0
 
         def _tbl_header(x_start):
@@ -2467,11 +2494,11 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
                 cur_x += cw
 
         def _tbl_row(x_start, cells, shade):
-            fam_r, _, _ = fnt(7); pdf.set_font(fam_r, "", 7)
             is_stop = str(cells[0]).endswith("(정지)")
+            fam_r, _, _ = fnt(7); pdf.set_font(fam_r, "", 7)
             if is_stop:
-                pdf.set_fill_color(240, 240, 245)   # 정지 구간 — 회색 배경
-                pdf.set_text_color(160, 160, 170)
+                pdf.set_fill_color(240, 240, 245)
+                pdf.set_text_color(155, 155, 165)
             elif shade:
                 pdf.set_fill_color(248, 249, 252)
                 pdf.set_text_color(50, 50, 50)
@@ -2481,70 +2508,38 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
             cur_x = x_start
             for ci, (cell, cw) in enumerate(zip(cells, cw_set)):
                 pdf.set_xy(cur_x, pdf.get_y())
-                # 정지 행의 첫 셀은 왼쪽 정렬로 읽기 쉽게
-                align = "L" if (is_stop and ci == 0) else "C"
+                align = "L" if ci == 0 else "C"
                 pdf.cell(cw, 4.5, str(cell), border=1, align=align, fill=True, ln=0)
                 cur_x += cw
 
-        def _is_stop(row_tuple):
-            return str(row_tuple[0]).endswith("(정지)")
-
-        def _stop_full_row(x_start, label, total_w):
-            """정지 행을 total_w 너비의 병합 셀 하나로 렌더링."""
-            fam_s, _, _ = fnt(7); pdf.set_font(fam_s, "", 7)
-            pdf.set_fill_color(240, 240, 245)
-            pdf.set_text_color(160, 160, 170)
-            pdf.set_xy(x_start, pdf.get_y())
-            pdf.cell(total_w, 4.5, label, border=1, align="C", fill=True, ln=0)
-
         if use_two_col:
-            x1        = pdf.l_margin
-            x2        = x1 + sum(cw_set) + gap
-            both_w    = sum(cw_set) * 2 + gap   # 정지 행 전체 너비
-            start_y   = pdf.get_y()
+            x1 = pdf.l_margin
+            x2 = x1 + sum(cw_set) + gap
+            start_y = pdf.get_y()
             _tbl_header(x1); pdf.set_xy(x2, start_y); _tbl_header(x2)
             pdf.ln(5)
-
-            # 정지 행 인덱스 파악: col1/col2 나누기 전 원본 tbl_rows 기준으로 2열 flow 렌더링
-            i1 = i2 = 0   # col1, col2 포인터
             shade_cnt = 0
-            while i1 < len(col1) or i2 < len(col2):
+            for i, r1 in enumerate(col1):
+                r2    = col2[i] if i < len(col2) else None
                 row_y = pdf.get_y()
-                r1 = col1[i1] if i1 < len(col1) else None
-                r2 = col2[i2] if i2 < len(col2) else None
-
-                if r1 and _is_stop(r1):
-                    # 정지 행 → 전체 너비 병합 셀
-                    _stop_full_row(x1, r1[0], both_w)
-                    pdf.ln(4.5)
-                    i1 += 1
-                elif r2 and _is_stop(r2) and r1 is None:
-                    _stop_full_row(x1, r2[0], both_w)
-                    pdf.ln(4.5)
-                    i2 += 1
-                else:
-                    shade = shade_cnt % 2 == 0
-                    if r1:
-                        _tbl_row(x1, r1, shade)
-                        i1 += 1
-                    if r2:
-                        pdf.set_xy(x2, row_y)
-                        _tbl_row(x2, r2, shade)
-                        i2 += 1
-                    pdf.ln(4.5)
+                is_s  = str(r1[0]).endswith("(정지)")
+                _tbl_row(x1, r1, shade_cnt % 2 == 0)
+                if r2:
+                    pdf.set_xy(x2, row_y)
+                    _tbl_row(x2, r2, shade_cnt % 2 == 0)
+                pdf.ln(4.5)
+                if not is_s:
                     shade_cnt += 1
         else:
-            x1      = pdf.l_margin
-            col_w   = sum(cw_set)
+            x1 = pdf.l_margin
             _tbl_header(x1); pdf.ln(5)
             shade_cnt = 0
             for r1 in col1:
-                if _is_stop(r1):
-                    _stop_full_row(x1, r1[0], col_w)
-                else:
-                    _tbl_row(x1, r1, shade_cnt % 2 == 0)
-                    shade_cnt += 1
+                is_s = str(r1[0]).endswith("(정지)")
+                _tbl_row(x1, r1, shade_cnt % 2 == 0)
                 pdf.ln(4.5)
+                if not is_s:
+                    shade_cnt += 1
 
     pdf.set_y(-15)
     fam9, _, _ = fnt(7); pdf.set_font(fam9, "", 7)
