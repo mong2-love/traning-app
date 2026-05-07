@@ -776,55 +776,81 @@ def coaching_feedback(row: dict) -> list:
     z3  = row.get("z3_pct") or 0
     z4  = row.get("z4_pct") or 0
     z5  = row.get("z5_pct") or 0
-    w_bpm        = row.get("w_per_bpm")
-    pace_drift   = row.get("pace_drift_sec")  # 러닝 전용, tab_today에서 주입
+    w_bpm      = row.get("w_per_bpm")
+    prev_wbpm  = row.get("_prev_wbpm")   # injected by generate_training_pdf
+    avg_cad    = row.get("avg_cadence")
+    pace_drift = row.get("pace_drift_sec")
 
+    # ── HR 드리프트 ───────────────────────────────────────────────────────────
+    if drift is not None and not pd.isna(drift):
+        d = abs(drift)
+        if d <= 7:
+            msgs.append(("success", f"심박 드리프트 {drift:+.1f}% — 심박이 안정적으로 유지됐습니다. 회복 상태 양호합니다."))
+        elif d <= 10:
+            msgs.append(("info",    f"심박 드리프트 {drift:+.1f}% — 약간 피로 누적이 보입니다. 수분 섭취와 수면을 체크하세요."))
+        elif d <= 15:
+            msgs.append(("warning", f"심박 드리프트 {drift:+.1f}% — 피로 상태입니다. 다음 훈련 강도를 5W(또는 5초/km) 낮추고 충분히 회복하세요."))
+        else:
+            msgs.append(("error",   f"심박 드리프트 {drift:+.1f}% — 과부하 상태입니다. 강도를 크게 줄이고 1~2일 회복 훈련을 권장합니다."))
+
+    # ── Z2 비율 ───────────────────────────────────────────────────────────────
     if is_running:
+        if z2 >= 80:
+            msgs.append(("success", f"Z2 비율 {z2:.0f}% — Z2 러닝 목표를 달성했습니다. 유산소 기반이 탄탄합니다."))
+        elif z2 >= 60:
+            msgs.append(("info",    f"Z2 비율 {z2:.0f}% — 부분 성공입니다. 다음 세션은 페이스를 5~8초/km 낮춰 Z2 타겟을 재조정해보세요."))
+        else:
+            msgs.append(("warning", f"Z2 비율 {z2:.0f}% — 강도가 높습니다. 페이스를 5~8초/km 낮추고 Z2 구간 유지에 집중하세요."))
         # 페이스 드리프트
         if pace_drift is not None:
             if abs(pace_drift) <= 10:
-                msgs.append(("success", f"페이스 드리프트 {pace_drift:+.0f}초/km — 매우 안정적인 페이스를 유지했습니다. ✅"))
+                msgs.append(("success", f"페이스 드리프트 {pace_drift:+.0f}초/km — 매우 안정적인 페이스를 유지했습니다."))
             elif abs(pace_drift) <= 20:
                 msgs.append(("info",    f"페이스 드리프트 {pace_drift:+.0f}초/km — 후반에 약간 느려졌습니다. 페이스 배분을 조절해보세요."))
             else:
                 msgs.append(("warning", f"페이스 드리프트 {pace_drift:+.0f}초/km — 초반 페이스가 너무 빨랐습니다. 출발 페이스를 낮춰보세요."))
-        # Z2 러닝 목표
-        if z2 >= 80:
-            msgs.append(("success", f"Z2 비율 {z2:.0f}% — Z2 러닝 목표를 달성했습니다. ✅ 유산소 기반이 탄탄합니다."))
-        elif z1 + z2 > 65:
-            msgs.append(("success", f"유산소 기반 훈련 {z1+z2:.0f}% — 지방 연소 효율 향상에 효과적인 훈련입니다."))
         if z4 + z5 > 30:
             msgs.append(("warning", f"고강도 구간 {z4+z5:.0f}% — 충분한 회복 후 다음 훈련에 임하세요."))
-        # HR 드리프트
-        if drift is not None and not pd.isna(drift):
-            if drift > 8:
-                msgs.append(("warning", f"심박 드리프트 {drift:+.1f}% — 탈수 또는 과부하 가능성. 수분 섭취를 확인하세요."))
-            elif drift > 4:
-                msgs.append(("info", f"심박 드리프트 {drift:+.1f}% — 후반부 심박이 올라갔습니다. 컨디션을 체크하세요."))
     else:
-        # 사이클링 / 기타
-        if drift is not None and not pd.isna(drift):
-            if drift > 8:
-                msgs.append(("warning", f"심박 드리프트 {drift:+.1f}% — 후반에 심박이 크게 올랐습니다. 수분 섭취와 페이스 조절을 확인하세요."))
-            elif drift > 4:
-                msgs.append(("info",    f"심박 드리프트 {drift:+.1f}% — 약간의 피로 누적이 감지됩니다."))
-            elif drift < -4:
-                msgs.append(("info",    f"심박 드리프트 {drift:+.1f}% — 후반에 강도가 낮아졌습니다."))
-            else:
-                msgs.append(("success", f"심박 드리프트 {drift:+.1f}% — 안정적인 페이스를 유지했습니다."))
-
+        # 사이클링 Z2
+        if z2 >= 80:
+            msgs.append(("success", f"Z2 비율 {z2:.0f}% — Z2 목표를 달성했습니다. 유산소 기반 훈련 효과가 우수합니다."))
+        elif z2 >= 60:
+            msgs.append(("info",    f"Z2 비율 {z2:.0f}% — 부분 성공입니다. 다음 세션은 출력을 5W 낮춰 Z2 구간에 집중하세요."))
+        else:
+            msgs.append(("warning", f"Z2 비율 {z2:.0f}% — 강도가 높았습니다. 출력을 5~8W 낮추고 Z2 유지에 집중하세요."))
         if z4 + z5 > 40:
             msgs.append(("warning", f"고강도 구간 {z4+z5:.0f}% — 인터벌 효과가 높았습니다. 다음 세션 전 충분히 회복하세요."))
-        elif z1 + z2 > 65:
-            msgs.append(("success", f"유산소 기반 훈련 {z1+z2:.0f}% — 지방 연소 및 기초 체력 향상에 효과적이었습니다."))
         elif z3 > 30:
             msgs.append(("info",    f"템포 구간 {z3:.0f}% — 젖산 역치 개선에 효과적인 훈련이었습니다."))
 
-        if w_bpm and not pd.isna(w_bpm):
+    # ── W/bpm 효율 (사이클링) ──────────────────────────────────────────────────
+    if not is_running and w_bpm and not pd.isna(w_bpm):
+        if prev_wbpm and not pd.isna(prev_wbpm):
+            diff = w_bpm - prev_wbpm
+            if diff > 0:
+                msgs.append(("success", f"W/bpm {w_bpm:.3f} (전 세션 대비 +{diff:.3f}) — 심폐 효율이 향상되고 있습니다."))
+            elif drift is not None and not pd.isna(drift) and abs(drift) > 7:
+                msgs.append(("info",    f"W/bpm {w_bpm:.3f} (전 세션 대비 {diff:.3f}) — 피로로 인한 일시적 하락으로 보입니다. 회복 후 재확인하세요."))
+            else:
+                msgs.append(("warning", f"W/bpm {w_bpm:.3f} (전 세션 대비 {diff:.3f}) — 효율 저하가 감지됩니다. 훈련 패턴과 수면을 점검하세요."))
+        else:
             if w_bpm > 2.0:
-                msgs.append(("success", f"W/bpm 효율 {w_bpm:.2f} — 심박 대비 출력이 우수합니다."))
+                msgs.append(("success", f"W/bpm 효율 {w_bpm:.3f} — 심박 대비 출력이 우수합니다."))
             elif w_bpm < 1.2:
-                msgs.append(("info",    f"W/bpm 효율 {w_bpm:.2f} — 효율 향상을 위해 저강도 지구력 훈련을 늘려보세요."))
+                msgs.append(("info",    f"W/bpm 효율 {w_bpm:.3f} — 효율 향상을 위해 저강도 지구력 훈련을 늘려보세요."))
+            else:
+                msgs.append(("info",    f"W/bpm 효율 {w_bpm:.3f} — 양호한 범위입니다. 꾸준한 훈련으로 향상시켜보세요."))
+
+    # ── 케이던스 ───────────────────────────────────────────────────────────────
+    if avg_cad and not pd.isna(avg_cad) and avg_cad > 0:
+        unit = "spm" if is_running else "rpm"
+        if avg_cad >= 88:
+            msgs.append(("success", f"평균 케이던스 {avg_cad:.0f} {unit} — 이상적인 케이던스 범위입니다."))
+        elif avg_cad >= 83:
+            msgs.append(("info",    f"평균 케이던스 {avg_cad:.0f} {unit} — 정상 범위입니다. 88 {unit} 이상을 목표로 해보세요."))
+        else:
+            msgs.append(("warning", f"평균 케이던스 {avg_cad:.0f} {unit} — 낮은 편입니다. 케이던스를 조금씩 높여보세요."))
 
     if not msgs:
         msgs.append(("info", "훈련 데이터가 충분히 쌓이면 더 자세한 피드백을 제공합니다."))
@@ -1942,6 +1968,31 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
     sport_key = "run" if is_running else "cycl"
     hist = df_c[df_c["sport"].str.contains(sport_key, case=False, na=False)].sort_values("date").tail(10)
 
+    # training count and prev W/bpm
+    _total_count = len(df_c[df_c["sport"].str.contains(sport_key, case=False, na=False)])
+    _prev_wbpm   = None
+    if not is_running:
+        prev_rows = hist[hist["filename"] != fname]["w_per_bpm"].dropna()
+        if len(prev_rows) > 0:
+            _prev_wbpm = float(prev_rows.iloc[-1])
+
+    # load raw data early to compute half-splits
+    raw_df = load_raw(fname)
+    _hr1 = _hr2 = _pwr1 = _pwr2 = None
+    if not raw_df.empty and "hr" in raw_df.columns:
+        hr_s = raw_df["hr"].dropna()
+        if len(hr_s) >= 4:
+            mid  = len(hr_s) // 2
+            _hr1 = round(float(hr_s.iloc[:mid].mean()), 1)
+            _hr2 = round(float(hr_s.iloc[mid:].mean()), 1)
+    if not is_running and not raw_df.empty and "watts" in raw_df.columns:
+        pw_s = raw_df["watts"].dropna()
+        pw_s = pw_s[pw_s > 0]
+        if len(pw_s) >= 4:
+            mid  = len(pw_s) // 2
+            _pwr1 = round(float(pw_s.iloc[:mid].mean()), 1)
+            _pwr2 = round(float(pw_s.iloc[mid:].mean()), 1)
+
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=10)
     if kr_font:
@@ -1970,20 +2021,29 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
     pdf.cell(pdf.epw, 8, f"[{icon_txt}] 훈련 리포트  {date_str}", ln=1, align="C")
     pdf.ln(2)
 
+    _wbpm_change_str = "-"
+    if not is_running and row.get("w_per_bpm") and _prev_wbpm:
+        diff = row["w_per_bpm"] - _prev_wbpm
+        _wbpm_change_str = f"{diff:+.3f} (전 {_prev_wbpm:.3f})"
+
     fields = [
-        ("종목",      row.get("sport", "-")),
-        ("파일",      os.path.basename(fname)),
-        ("코스",      row.get("course_name") or "-"),
-        ("실내/실외", "실내" if row.get("indoor") else "실외"),
-        ("거리",      f"{row['distance_km']:.2f} km"       if row.get("distance_km")   else "-"),
-        ("이동 시간", fmt_duration(row.get("moving_time_sec") or row.get("duration_sec"))),
-        ("정지 시간", fmt_duration(row.get("stop_time_sec")) if row.get("stop_time_sec") else "-"),
-        ("평균 속도", f"{row['avg_speed_kph']:.1f} km/h"   if row.get("avg_speed_kph") else "-"),
-        ("칼로리",    f"{row['calories']:.0f} kcal"         if row.get("calories")      else "-"),
-        ("실내 온도", f"{row['indoor_temp']:.1f} °C"        if row.get("indoor_temp")   else "-"),
-        ("평균 심박", f"{row['avg_hr']:.0f} bpm"            if row.get("avg_hr")        else "-"),
-        ("최대 심박", f"{row['max_hr']:.0f} bpm"            if row.get("max_hr")        else "-"),
-        ("HR 드리프트", f"{row['drift']:+.1f}%"             if row.get("drift") else "-"),
+        ("종목",          row.get("sport", "-")),
+        ("파일",          os.path.basename(fname)),
+        ("코스",          row.get("course_name") or "-"),
+        ("실내/실외",     "실내" if row.get("indoor") else "실외"),
+        ("거리",          f"{row['distance_km']:.2f} km"       if row.get("distance_km")   else "-"),
+        ("이동 시간",     fmt_duration(row.get("moving_time_sec") or row.get("duration_sec"))),
+        ("정지 시간",     fmt_duration(row.get("stop_time_sec")) if row.get("stop_time_sec") else "-"),
+        ("평균 속도",     f"{row['avg_speed_kph']:.1f} km/h"   if row.get("avg_speed_kph") else "-"),
+        ("칼로리",        f"{row['calories']:.0f} kcal"         if row.get("calories")      else "-"),
+        ("실내 온도",     f"{row['indoor_temp']:.1f} °C"        if row.get("indoor_temp")   else "-"),
+        ("총 훈련 횟수",  f"{_total_count}회"),
+        ("평균 심박",     f"{row['avg_hr']:.0f} bpm"            if row.get("avg_hr")        else "-"),
+        ("최대 심박",     f"{row['max_hr']:.0f} bpm"            if row.get("max_hr")        else "-"),
+        ("전반부 평균 심박", f"{_hr1:.0f} bpm" if _hr1 is not None else "-"),
+        ("후반부 평균 심박", f"{_hr2:.0f} bpm" if _hr2 is not None else "-"),
+        ("심박 드리프트", f"{row['drift']:+.1f}% ({row['drift'] - 0:.1f} bpm 환산)" if row.get("drift") and _hr1 else
+                          (f"{row['drift']:+.1f}%" if row.get("drift") else "-")),
         ("드리프트 평가", row.get("drift_grade") or "-"),
     ]
     if is_running:
@@ -1995,11 +2055,14 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
         ]
     else:
         fields += [
-            ("평균 파워",  f"{row['avg_power']:.0f} W"  if row.get("avg_power")  else "-"),
-            ("최대 파워",  f"{row['max_power']:.0f} W"  if row.get("max_power")  else "-"),
-            ("W/bpm",     f"{row['w_per_bpm']:.3f}"     if row.get("w_per_bpm")  else "-"),
-            ("스파이크",   f"{row['spike_count']}개 보정" if row.get("spike_count") else "없음"),
-            ("평균 케이던스", f"{row['avg_cadence']:.0f} rpm" if row.get("avg_cadence") else "-"),
+            ("전반부 평균 파워", f"{_pwr1:.0f} W" if _pwr1 is not None else "-"),
+            ("후반부 평균 파워", f"{_pwr2:.0f} W" if _pwr2 is not None else "-"),
+            ("평균 파워",        f"{row['avg_power']:.0f} W"  if row.get("avg_power")  else "-"),
+            ("최대 파워",        f"{row['max_power']:.0f} W"  if row.get("max_power")  else "-"),
+            ("W/bpm",            f"{row['w_per_bpm']:.3f}"     if row.get("w_per_bpm")  else "-"),
+            ("W/bpm 변화",       _wbpm_change_str),
+            ("스파이크",         f"{row['spike_count']}개 보정" if row.get("spike_count") else "없음"),
+            ("평균 케이던스",    f"{row['avg_cadence']:.0f} rpm" if row.get("avg_cadence") else "-"),
         ]
 
     lw = 38  # 레이블 너비
@@ -2037,7 +2100,6 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
         fig.tight_layout(); _add_chart(fig, 48)
 
     # 분당 심박 + 파워/페이스 차트
-    raw_df = load_raw(fname)
     if not raw_df.empty and "secs" in raw_df.columns:
         raw_df = raw_df.copy()
         raw_df["min"] = (raw_df["secs"] // 60).astype(int)
@@ -2093,7 +2155,9 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
 
     fam4, _, _ = fnt(10, True); pdf.set_font(fam4, "B", 10)
     pdf.cell(pdf.epw, 7, "코칭 피드백", ln=1)
-    for level, msg in coaching_feedback(dict(row)):
+    _cf_row = dict(row)
+    _cf_row["_prev_wbpm"] = _prev_wbpm
+    for level, msg in coaching_feedback(_cf_row):
         icon_m = {"success": "[OK]", "warning": "[!]", "error": "[X]"}.get(level, "[i]")
         fam5, _, _ = fnt(8); pdf.set_font(fam5, "", 8)
         pdf.multi_cell(pdf.epw, 5, f"{icon_m} {msg}", ln=1)
@@ -2114,6 +2178,111 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
             for h in headers:
                 pdf.cell(cw2, 5, str(lap.get(h, "")), border=1, align="C", ln=0)
             pdf.ln()
+
+    # ── Page 3: 분당 시계열 데이터 ──────────────────────────────────────────────
+    if not raw_df.empty and "secs" in raw_df.columns:
+        pdf.add_page()
+        fam_t, sty_t, sz_t = fnt(11, True)
+        pdf.set_font(fam_t, sty_t, sz_t)
+        pdf.set_text_color(40, 40, 40)
+        pdf.cell(pdf.epw, 8, "분당 시계열 데이터", ln=1)
+        pdf.ln(1)
+
+        rdf = raw_df.copy()
+        rdf["min"] = (rdf["secs"] // 60).astype(int)
+
+        # detect moving minutes (speed > 0.5 km/h, or watts > 0 for cycling)
+        if "speed" in rdf.columns:
+            rdf["_moving"] = rdf["speed"] > 0.5
+        elif "watts" in rdf.columns:
+            rdf["_moving"] = rdf["watts"] > 0
+        else:
+            rdf["_moving"] = True
+
+        agg_dict = {}
+        if "hr"    in rdf.columns: agg_dict["hr"]    = ("hr",    "mean")
+        if "watts" in rdf.columns: agg_dict["watts"] = ("watts", "mean")
+        if "pace"  in rdf.columns: agg_dict["pace"]  = ("pace",  "median")
+        if "cad"   in rdf.columns: agg_dict["cad"]   = ("cad",   "mean")
+        if "speed" in rdf.columns: agg_dict["spd"]   = ("speed", "mean")
+        agg_dict["moving"] = ("_moving", "mean")
+
+        mdf3 = rdf.groupby("min").agg(**agg_dict).reset_index()
+
+        # build rows list
+        tbl_rows = []
+        for _, mr in mdf3.iterrows():
+            m_val   = int(mr["min"])
+            moving  = mr.get("moving", 1.0) > 0.3
+            hr_val  = f"{mr['hr']:.0f}" if "hr" in mr.index and not pd.isna(mr.get("hr", float('nan'))) and moving else "-"
+            if is_running:
+                p_val = fmt_pace(mr.get("pace")) if "pace" in mr.index and not pd.isna(mr.get("pace", float('nan'))) and moving else "-"
+            else:
+                p_val = f"{mr['watts']:.0f}" if "watts" in mr.index and not pd.isna(mr.get("watts", float('nan'))) and moving else "-"
+            cad_val = f"{mr['cad']:.0f}" if "cad"  in mr.index and not pd.isna(mr.get("cad", float('nan'))) and moving else "-"
+            spd_val = f"{mr['spd']:.1f}" if "spd"  in mr.index and not pd.isna(mr.get("spd", float('nan'))) and moving else "-"
+            tbl_rows.append((str(m_val), hr_val, p_val, cad_val, spd_val))
+
+        p_hdr = "페이스(분:초/km)" if is_running else "파워(W)"
+        hdrs  = ["경과(분)", "심박(bpm)", p_hdr, "케이던스(rpm)", "속도(km/h)"]
+
+        use_two_col = len(tbl_rows) > 20
+        if use_two_col:
+            half   = (len(tbl_rows) + 1) // 2
+            col1   = tbl_rows[:half]
+            col2   = tbl_rows[half:]
+            cw_set = [10, 14, 22, 18, 14]  # widths per sub-col (sum=78)
+            gap    = 4                       # gap between the two columns
+        else:
+            col1   = tbl_rows
+            col2   = []
+            cw_set = [14, 18, 30, 24, 20]  # single column widths (sum≈106)
+            gap    = 0
+
+        def _tbl_header(x_start):
+            fam_h, _, _ = fnt(7, True); pdf.set_font(fam_h, "B", 7)
+            pdf.set_fill_color(230, 235, 245); pdf.set_text_color(40, 40, 40)
+            cur_x = x_start
+            for hd, cw in zip(hdrs, cw_set):
+                pdf.set_xy(cur_x, pdf.get_y())
+                pdf.cell(cw, 5, hd, border=1, align="C", fill=True, ln=0)
+                cur_x += cw
+
+        def _tbl_row(x_start, cells, shade):
+            fam_r, _, _ = fnt(7); pdf.set_font(fam_r, "", 7)
+            if shade:
+                pdf.set_fill_color(248, 249, 252)
+            else:
+                pdf.set_fill_color(255, 255, 255)
+            pdf.set_text_color(50, 50, 50)
+            cur_x = x_start
+            for cell, cw in zip(cells, cw_set):
+                pdf.set_xy(cur_x, pdf.get_y())
+                pdf.cell(cw, 4.5, str(cell), border=1, align="C", fill=True, ln=0)
+                cur_x += cw
+
+        if use_two_col:
+            x1 = pdf.l_margin
+            x2 = x1 + sum(cw_set) + gap
+            # header row for both columns
+            start_y = pdf.get_y()
+            _tbl_header(x1); pdf.set_xy(x2, start_y); _tbl_header(x2)
+            pdf.ln(5)
+            for i, r1 in enumerate(col1):
+                r2      = col2[i] if i < len(col2) else None
+                row_y   = pdf.get_y()
+                _tbl_row(x1, r1, i % 2 == 0)
+                if r2:
+                    pdf.set_xy(x2, row_y)
+                    _tbl_row(x2, r2, i % 2 == 0)
+                pdf.ln(4.5)
+        else:
+            x1 = pdf.l_margin
+            _tbl_header(x1); pdf.ln(5)
+            for i, r1 in enumerate(col1):
+                row_y = pdf.get_y()
+                _tbl_row(x1, r1, i % 2 == 0)
+                pdf.ln(4.5)
 
     pdf.set_y(-15)
     fam9, _, _ = fnt(7); pdf.set_font(fam9, "", 7)
