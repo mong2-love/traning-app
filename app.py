@@ -1709,7 +1709,7 @@ def generate_pdf_report(period_df: pd.DataFrame, period_type: str,
             except Exception:
                 pass
 
-    def fnt(sz): return (kr_font or "Helvetica"), sz
+    def fnt(sz): return (kr_font or "Helvetica"), "", sz
 
     def _add_chart(fig, h=52):
         try:
