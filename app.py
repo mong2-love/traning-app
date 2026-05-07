@@ -115,6 +115,35 @@ def assign_zone(bpm, zones):
     return 5
 
 
+def _extract_kst_date(path: str) -> str | None:
+    """FIT/GPX 파일에서 첫 번째 타임스탬프를 읽어 KST 날짜 문자열(YYYY-MM-DD)을 반환."""
+    if not path or not os.path.exists(path):
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".fit":
+            from fitparse import FitFile
+            fit = FitFile(path)
+            for msg in fit.get_messages("record"):
+                for field in msg.fields:
+                    if field.name == "timestamp" and field.value is not None:
+                        ts = pd.Timestamp(field.value).tz_localize("UTC")
+                        return ts.tz_convert("Asia/Seoul").strftime("%Y-%m-%d")
+        elif ext == ".gpx":
+            import gpxpy
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                gpx = gpxpy.parse(f)
+            for track in gpx.tracks:
+                for seg in track.segments:
+                    for pt in seg.points:
+                        if pt.time:
+                            ts = pd.Timestamp(pt.time).tz_convert("Asia/Seoul")
+                            return ts.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return None
+
+
 def _drift_grade(drift):
     if drift is None or (isinstance(drift, float) and math.isnan(drift)):
         return None
@@ -2616,6 +2645,26 @@ def tab_settings(max_hr: int, ftp: int):
     with get_conn() as conn:
         cnt = conn.execute("SELECT COUNT(*) FROM training_log").fetchone()[0]
     st.metric("저장된 훈련 수", cnt)
+
+    st.markdown("---")
+    st.subheader("날짜 재파싱")
+    st.caption("FIT/GPX 타임스탬프를 다시 읽어 KST 날짜로 업데이트합니다. 파일이 원래 경로에 남아 있어야 합니다.")
+    if st.button("🗓️ 전체 날짜 재파싱", type="secondary"):
+        with get_conn() as conn:
+            rows = conn.execute("SELECT id, filename FROM training_log").fetchall()
+        updated, skipped = 0, 0
+        for row_id, fname in rows:
+            new_date = _extract_kst_date(fname)
+            if new_date:
+                with get_conn() as conn:
+                    conn.execute("UPDATE training_log SET date = ? WHERE id = ?",
+                                 (new_date, row_id))
+                updated += 1
+            else:
+                skipped += 1
+        st.success(f"완료: {updated}개 날짜 업데이트 / {skipped}개 파일 미발견(재업로드 필요)")
+        if updated:
+            st.rerun()
 
     if st.button("⚠️ 전체 데이터 삭제", type="secondary"):
         confirm = st.checkbox("정말 삭제하시겠습니까?")
