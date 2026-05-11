@@ -209,12 +209,18 @@ def _extract_kst_date(path: str) -> str | None:
     return _date_from_filename(path or "")
 
 
-def _drift_grade(drift):
+def _drift_grade(drift, indoor=True):
     if drift is None or (isinstance(drift, float) and math.isnan(drift)):
         return None
-    if abs(drift) <= 4: return "정상"
-    if abs(drift) <= 8: return "주의"
-    return "피로"
+    d = abs(drift)
+    if indoor:
+        if d <= 7:  return "정상"
+        if d <= 10: return "주의"
+        return "피로"
+    else:
+        if d <= 10: return "정상"
+        if d <= 15: return "주의"
+        return "피로"
 
 
 def _cad_zones(cad_series: pd.Series) -> dict:
@@ -481,7 +487,7 @@ def parse_fit(path: str, max_hr: int, ftp: int):
         avg_hr=round(avg_hr, 1)           if avg_hr       else None,
         max_hr=round(max_hr_val, 1)       if max_hr_val   else None,
         drift=drift,
-        drift_grade=_drift_grade(drift),
+        drift_grade=_drift_grade(drift, indoor=bool(indoor_flag)),
         avg_power=round(avg_power, 1)     if avg_power    else None,
         max_power=round(max_power, 1)     if max_power    else None,
         avg_cadence=round(avg_cad, 1)     if avg_cad      else None,
@@ -646,7 +652,7 @@ def parse_gpx(path: str, max_hr: int, ftp: int):
         avg_hr=round(avg_hr, 1)           if avg_hr       else None,
         max_hr=round(max_hr_val, 1)       if max_hr_val   else None,
         drift=drift,
-        drift_grade=_drift_grade(drift),
+        drift_grade=_drift_grade(drift, indoor=False),
         avg_power=None, max_power=None,
         avg_cadence=None, w_per_bpm=None,
         spike_count=0, spike_corrected=0,
@@ -822,7 +828,7 @@ def parse_csv(path: str, max_hr: int, ftp: int):
         avg_hr=round(avg_hr, 1)            if avg_hr       else None,
         max_hr=round(max_hr_val, 1)        if max_hr_val   else None,
         drift=drift,
-        drift_grade=_drift_grade(drift),
+        drift_grade=_drift_grade(drift, indoor=True),
         avg_power=round(avg_power, 1)      if avg_power    else None,
         max_power=round(max_power, 1)      if max_power    else None,
         avg_cadence=round(avg_cad, 1)      if avg_cad      else None,
@@ -921,17 +927,25 @@ def coaching_feedback(row: dict) -> list:
     avg_cad    = row.get("avg_cadence")
     pace_drift = row.get("pace_drift_sec")
 
-    # ── HR 드리프트 ───────────────────────────────────────────────────────────
+    # ── HR 드리프트 (실내/실외 기준 분리) ────────────────────────────────────
     if drift is not None and not pd.isna(drift):
         d = abs(drift)
-        if d <= 7:
-            msgs.append(("success", f"심박 드리프트 {drift:+.1f}% — 심박이 안정적으로 유지됐습니다. 회복 상태 양호합니다."))
-        elif d <= 10:
-            msgs.append(("info",    f"심박 드리프트 {drift:+.1f}% — 약간 피로 누적이 보입니다. 수분 섭취와 수면을 체크하세요."))
-        elif d <= 15:
-            msgs.append(("warning", f"심박 드리프트 {drift:+.1f}% — 피로 상태입니다. 다음 훈련 강도를 5W(또는 5초/km) 낮추고 충분히 회복하세요."))
+        if is_indoor:
+            # 실내: ≤7% 정상 / 7~10% 주의 / >10% 피로
+            if d <= 7:
+                msgs.append(("success", f"심박 드리프트 {drift:+.1f}% — 실내 기준 안정적입니다. 회복 상태 양호합니다."))
+            elif d <= 10:
+                msgs.append(("info",    f"심박 드리프트 {drift:+.1f}% — 실내 기준 주의 구간입니다. 수분 섭취와 수면을 체크하세요."))
+            else:
+                msgs.append(("warning", f"심박 드리프트 {drift:+.1f}% — 실내 기준 피로 상태입니다. 다음 훈련 강도를 낮추고 충분히 회복하세요."))
         else:
-            msgs.append(("error",   f"심박 드리프트 {drift:+.1f}% — 과부하 상태입니다. 강도를 크게 줄이고 1~2일 회복 훈련을 권장합니다."))
+            # 실외: ≤10% 정상 / 10~15% 주의 / >15% 피로
+            if d <= 10:
+                msgs.append(("success", f"심박 드리프트 {drift:+.1f}% — 야외 기준 안정적입니다. 회복 상태 양호합니다."))
+            elif d <= 15:
+                msgs.append(("info",    f"심박 드리프트 {drift:+.1f}% — 야외 기준 주의 구간입니다. 수분 섭취와 수면을 체크하세요."))
+            else:
+                msgs.append(("warning", f"심박 드리프트 {drift:+.1f}% — 야외 기준 피로 상태입니다. 강도를 낮추고 충분히 회복하세요."))
 
     # ── Z2 비율 ───────────────────────────────────────────────────────────────
     if is_running:
@@ -1773,19 +1787,29 @@ def tab_heatmap(df: pd.DataFrame):
                     if not raw_df.empty and "secs" in raw_df.columns:
                         raw_df = raw_df.copy()
                         raw_df["min"] = (raw_df["secs"] // 60).astype(int)
+                        _secs_cal  = pd.to_numeric(raw_df["secs"], errors="coerce")
+                        _gap_cal   = set(raw_df.loc[_secs_cal.diff() >= 30, "min"].tolist())
+
+                        def _cal_gaps(grp):
+                            mn, mx = int(grp.index.min()), int(grp.index.max())
+                            grp = grp.reindex(range(mn, mx + 1))
+                            if _gap_cal:
+                                grp.loc[grp.index.isin(_gap_cal)] = float("nan")
+                            return grp.reset_index()
+
                         if is_run and {"hr", "pace"}.issubset(raw_df.columns):
-                            mdf2 = raw_df.groupby("min").agg(hr=("hr","mean"), pace=("pace","median")).reset_index()
+                            mdf2 = _cal_gaps(raw_df.groupby("min").agg(hr=("hr","mean"), pace=("pace","median")))
                             fig_r = make_subplots(specs=[[{"secondary_y": True}]])
-                            fig_r.add_trace(go.Scatter(x=mdf2["min"], y=mdf2["hr"],   name="심박",   line=dict(color="#E24B4A", width=1.5)), secondary_y=False)
-                            fig_r.add_trace(go.Scatter(x=mdf2["min"], y=mdf2["pace"], name="페이스", line=dict(color="#4A90D9", width=1.5)), secondary_y=True)
+                            fig_r.add_trace(go.Scatter(x=mdf2["min"], y=mdf2["hr"],   name="심박",   line=dict(color="#E24B4A", width=1.5), connectgaps=False), secondary_y=False)
+                            fig_r.add_trace(go.Scatter(x=mdf2["min"], y=mdf2["pace"], name="페이스", line=dict(color="#4A90D9", width=1.5), connectgaps=False), secondary_y=True)
                             fig_r.update_yaxes(secondary_y=True, autorange="reversed")
                             fig_r.update_layout(height=200, margin=dict(t=10,b=10,l=10,r=10), legend=dict(orientation="h",y=1.15))
                             st.plotly_chart(fig_r, use_container_width=True)
                         elif not is_run and {"hr", "watts"}.issubset(raw_df.columns):
-                            mdf2 = raw_df.groupby("min").agg(hr=("hr","mean"), watts=("watts","mean")).reset_index()
+                            mdf2 = _cal_gaps(raw_df.groupby("min").agg(hr=("hr","mean"), watts=("watts","mean")))
                             fig_r = make_subplots(specs=[[{"secondary_y": True}]])
-                            fig_r.add_trace(go.Scatter(x=mdf2["min"], y=mdf2["hr"],    name="심박", line=dict(color="#E24B4A", width=1.5)), secondary_y=False)
-                            fig_r.add_trace(go.Scatter(x=mdf2["min"], y=mdf2["watts"], name="파워", line=dict(color="#4A90D9", width=1.5)), secondary_y=True)
+                            fig_r.add_trace(go.Scatter(x=mdf2["min"], y=mdf2["hr"],    name="심박", line=dict(color="#E24B4A", width=1.5), connectgaps=False), secondary_y=False)
+                            fig_r.add_trace(go.Scatter(x=mdf2["min"], y=mdf2["watts"], name="파워", line=dict(color="#4A90D9", width=1.5), connectgaps=False), secondary_y=True)
                             fig_r.update_layout(height=200, margin=dict(t=10,b=10,l=10,r=10), legend=dict(orientation="h",y=1.15))
                             st.plotly_chart(fig_r, use_container_width=True)
 
@@ -2175,13 +2199,19 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
     sport_key = "run" if is_running else "cycl"
     hist = df_c[df_c["sport"].str.contains(sport_key, case=False, na=False)].sort_values("date").tail(10)
 
-    # training count and prev W/bpm
-    _total_count = len(df_c[df_c["sport"].str.contains(sport_key, case=False, na=False)])
-    _prev_wbpm   = None
+    # training count and prev W/bpm (same indoor/outdoor type only)
+    _total_count  = len(df_c[df_c["sport"].str.contains(sport_key, case=False, na=False)])
+    _prev_wbpm    = None
+    _prev_env     = None
     if not is_running:
-        prev_rows = hist[hist["filename"] != fname]["w_per_bpm"].dropna()
-        if len(prev_rows) > 0:
-            _prev_wbpm = float(prev_rows.iloc[-1])
+        _is_indoor_cur = bool(row.get("indoor"))
+        _same_type = hist[
+            (hist["filename"] != fname) &
+            (hist["indoor"].fillna(0).astype(bool) == _is_indoor_cur)
+        ]["w_per_bpm"].dropna()
+        if len(_same_type) > 0:
+            _prev_wbpm = float(_same_type.iloc[-1])
+            _prev_env  = "실내" if _is_indoor_cur else "실외"
 
     # load raw data early to compute half-splits
     raw_df = load_raw(fname)
@@ -2235,7 +2265,7 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
     _wbpm_change_str = "-"
     if not is_running and _g("w_per_bpm") is not None and _prev_wbpm is not None:
         diff = _g("w_per_bpm") - _prev_wbpm
-        _wbpm_change_str = f"{diff:+.3f} (전 {_prev_wbpm:.3f})"
+        _wbpm_change_str = f"{diff:+.3f} (전 {_prev_env} 세션 {_prev_wbpm:.3f})"
 
     _drift = _g("drift")
     if _drift is not None and _hr1 is not None and _hr2 is not None:
@@ -2327,8 +2357,20 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
     if not raw_df.empty and "secs" in raw_df.columns:
         raw_df = raw_df.copy()
         raw_df["min"] = (raw_df["secs"] // 60).astype(int)
+        # 30초 이상 갭 → 해당 분을 NaN으로 처리해 선 끊기
+        _secs_n  = pd.to_numeric(raw_df["secs"], errors="coerce")
+        _gap_min_set = set(raw_df.loc[_secs_n.diff() >= 30, "min"].tolist())
+
+        def _reindex_gaps(grp_df):
+            """groupby("min") 결과를 전체 분 범위로 reindex 후 갭 분 NaN 처리."""
+            mn, mx = int(grp_df.index.min()), int(grp_df.index.max())
+            grp_df = grp_df.reindex(range(mn, mx + 1))
+            if _gap_min_set:
+                grp_df.loc[grp_df.index.isin(_gap_min_set)] = float("nan")
+            return grp_df.reset_index()
+
         if is_running and {"hr","pace"}.issubset(raw_df.columns):
-            mdf2 = raw_df.groupby("min").agg(hr=("hr","mean"), pace=("pace","median")).reset_index()
+            mdf2 = _reindex_gaps(raw_df.groupby("min").agg(hr=("hr","mean"), pace=("pace","median")))
             fig, ax1 = plt.subplots(figsize=(7, 2.8))
             ax1.plot(mdf2["min"], mdf2["hr"],   color="#E24B4A", linewidth=1.5, label="심박(bpm)")
             ax2 = ax1.twinx()
@@ -2340,7 +2382,7 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
             ax1.set_title("분당 심박 & 페이스", fontsize=9)
             fig.tight_layout(); _add_chart(fig, 60)
         elif not is_running and {"hr","watts"}.issubset(raw_df.columns):
-            mdf2 = raw_df.groupby("min").agg(hr=("hr","mean"), watts=("watts","mean")).reset_index()
+            mdf2 = _reindex_gaps(raw_df.groupby("min").agg(hr=("hr","mean"), watts=("watts","mean")))
             fig, ax1 = plt.subplots(figsize=(7, 2.8))
             ax1.plot(mdf2["min"], mdf2["hr"],    color="#E24B4A", linewidth=1.5, label="심박(bpm)")
             ax2 = ax1.twinx()
@@ -2369,7 +2411,14 @@ def generate_training_pdf(row: dict, df: pd.DataFrame, max_hr: int, ftp: int) ->
 
     drift_h = hist["drift"].dropna() if len(hist) >= 2 else pd.Series(dtype=float)
     if len(drift_h) >= 2:
-        colors_d = ["#9FE1CB" if abs(v) <= 4 else "#FAC775" if abs(v) <= 8 else "#E24B4A" for v in drift_h.values]
+        _drift_indoor = hist.loc[drift_h.index, "indoor"].fillna(0).astype(bool)
+        colors_d = []
+        for v, ind in zip(drift_h.values, _drift_indoor):
+            d = abs(v)
+            if ind:
+                colors_d.append("#9FE1CB" if d <= 7 else "#FAC775" if d <= 10 else "#E24B4A")
+            else:
+                colors_d.append("#9FE1CB" if d <= 10 else "#FAC775" if d <= 15 else "#E24B4A")
         fig, ax = plt.subplots(figsize=(7, 2.5))
         ax.bar(range(len(drift_h)), drift_h.values, color=colors_d)
         ax.axhline(0, color="#888", linewidth=0.8)
@@ -2674,21 +2723,32 @@ def show_training_detail(row, df: pd.DataFrame, max_hr: int, ftp: int):
     if not raw_df.empty and "secs" in raw_df.columns:
         rdf = raw_df.copy()
         rdf["min"] = (rdf["secs"] // 60).astype(int)
+        # 30초 이상 갭 → 해당 분 NaN 처리로 선 끊기
+        _secs_rdf   = pd.to_numeric(rdf["secs"], errors="coerce")
+        _gap_mins_d = set(rdf.loc[_secs_rdf.diff() >= 30, "min"].tolist())
+
+        def _rd_gaps(grp):
+            mn, mx = int(grp.index.min()), int(grp.index.max())
+            grp = grp.reindex(range(mn, mx + 1))
+            if _gap_mins_d:
+                grp.loc[grp.index.isin(_gap_mins_d)] = float("nan")
+            return grp.reset_index()
+
         if is_running and {"hr", "pace"}.issubset(rdf.columns):
-            mdf = rdf.groupby("min").agg(hr=("hr","mean"), pace=("pace","median")).reset_index()
+            mdf = _rd_gaps(rdf.groupby("min").agg(hr=("hr","mean"), pace=("pace","median")))
             fig_r = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["hr"],   name="심박(bpm)", line=dict(color="#E24B4A", width=2)), secondary_y=False)
-            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["pace"], name="페이스(초/km)", line=dict(color="#4A90D9", width=2)), secondary_y=True)
+            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["hr"],   name="심박(bpm)", line=dict(color="#E24B4A", width=2), connectgaps=False), secondary_y=False)
+            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["pace"], name="페이스(초/km)", line=dict(color="#4A90D9", width=2), connectgaps=False), secondary_y=True)
             fig_r.update_layout(title="분당 심박 & 페이스", height=270, margin=dict(t=35,b=10,l=10,r=10), legend=dict(orientation="h",y=1.12))
             fig_r.update_xaxes(title_text="경과 시간 (분)")
             fig_r.update_yaxes(title_text="심박 (bpm)", secondary_y=False)
             fig_r.update_yaxes(title_text="페이스 (초/km)", secondary_y=True, autorange="reversed")
             st.plotly_chart(fig_r, use_container_width=True)
         elif not is_running and {"hr", "watts"}.issubset(rdf.columns):
-            mdf = rdf.groupby("min").agg(hr=("hr","mean"), watts=("watts","mean")).reset_index()
+            mdf = _rd_gaps(rdf.groupby("min").agg(hr=("hr","mean"), watts=("watts","mean")))
             fig_r = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["hr"],    name="심박(bpm)", line=dict(color="#E24B4A", width=2)), secondary_y=False)
-            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["watts"], name="파워(W)",   line=dict(color="#4A90D9", width=2)), secondary_y=True)
+            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["hr"],    name="심박(bpm)", line=dict(color="#E24B4A", width=2), connectgaps=False), secondary_y=False)
+            fig_r.add_trace(go.Scatter(x=mdf["min"], y=mdf["watts"], name="파워(W)",   line=dict(color="#4A90D9", width=2), connectgaps=False), secondary_y=True)
             fig_r.update_layout(title="분당 심박 & 파워", height=270, margin=dict(t=35,b=10,l=10,r=10), legend=dict(orientation="h",y=1.12))
             fig_r.update_xaxes(title_text="경과 시간 (분)")
             fig_r.update_yaxes(title_text="심박 (bpm)", secondary_y=False)
